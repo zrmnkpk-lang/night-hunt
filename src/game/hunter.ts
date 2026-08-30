@@ -10,7 +10,7 @@ import type { GameCtx } from './context'
 import type { Survivor } from './survivor'
 
 const ATTACK_RANGE = 2.86 // 攻击触发距离(+30% 原 2.2),命中判定自动跟随
-const ATTACK_WINDUP = 0.35 // 攻击前摇(更快出手)
+const ATTACK_WINDUP = 0.22 // 攻击前摇(大幅加快,期间可半速移动)
 const SIGHT_RANGE = 19
 const HEAR_RANGE = 30
 
@@ -227,6 +227,17 @@ export class Hunter {
     return this.state === 'carry' && this.carriedId >= 0
   }
 
+  // 玩家扮演杀手时为 true:AI 寻路/巡逻/追击逻辑关闭,移动与朝向由 Engine 驱动
+  isPlayerControlled = false
+  setPlayerControlled(v: boolean): void {
+    this.isPlayerControlled = v
+  }
+
+  // 玩家杀手的自由移动速度(Engine 移动时取用):含追击叠加,与 AI 同规则
+  playerMoveSpeed(): number {
+    return SPEED.hunterPlayerChase * this.speedMul * (1 + this.chaseBuffPct)
+  }
+
   update(ctx: GameCtx, dt: number): void {
     this.attackCd = Math.max(0, this.attackCd - dt)
     this.sectorFlashT = Math.max(0, this.sectorFlashT - dt)
@@ -239,6 +250,13 @@ export class Hunter {
       this.x = this.vaultFrom.x + (this.vaultTo.x - this.vaultFrom.x) * t
       this.z = this.vaultFrom.z + (this.vaultTo.z - this.vaultFrom.z) * t
       this.speedNow = 1.2
+      this.syncMesh(dt, ctx.time)
+      return
+    }
+
+    // 玩家扮演:只跑动作状态机(攻击/恢复/扛起/挂椅/破坏/瞬移),移动朝向由 Engine 驱动
+    if (this.isPlayerControlled) {
+      this.updateAsPlayer(ctx, dt)
       this.syncMesh(dt, ctx.time)
       return
     }
@@ -271,24 +289,52 @@ export class Hunter {
       }
       case 'attack': {
         this.attackWindup -= dt
-        this.speedNow = 0
+        // 前摇期间可继续移动:半速朝目标逼近(边冲边挥),不再原地站桩。
+        // 玩家扮演时移动由 Engine 驱动(50% 速),这里只跑前摇计时。
+        const ts = this.target >= 0 ? ctx.survivors[this.target] : null
+        if (!this.isPlayerControlled && ts && ts.alive) {
+          const sp = SPEED.hunterChase * this.speedMul * 0.5
+          const dx = ts.x - this.x
+          const dz = ts.z - this.z
+          const dl = Math.hypot(dx, dz) || 1
+          this.moveWithCollision(ctx, (dx / dl) * sp * dt, (dz / dl) * sp * dt)
+          this.yaw = Math.atan2(dx, dz)
+          this.speedNow = sp
+        } else if (!this.isPlayerControlled) {
+          this.speedNow = 0
+        }
         if (this.attackWindup <= 0) {
           this.resolveAttack(ctx)
           // resolveAttack 可能已切换到 pickup(击倒目标)
           if (this.state === 'attack') {
-            // 命中或落空:进入 0.8 秒原地恢复(后摇)
+            // 命中或落空:进入短暂恢复(后摇)
             this.state = 'recover'
-            this.recoverT = 0.8
+            this.recoverT = 0.45
           }
         }
         break
       }
       case 'recover': {
         this.recoverT -= dt
-        this.speedNow = 0
+        // 命中/落空后的恢复期不再定身:垂刀动画照播,AI 以 60% 速继续逼近(消除停滞感)。
+        // 玩家扮演时移动由 Engine 驱动(60% 速)。
+        if (!this.isPlayerControlled) {
+          const rs = this.target >= 0 ? ctx.survivors[this.target] : null
+          if (rs && rs.alive && !rs.incapacitated) {
+            const sp = SPEED.hunterChase * this.speedMul * 0.6
+            const dx = rs.x - this.x
+            const dz = rs.z - this.z
+            const dl = Math.hypot(dx, dz) || 1
+            this.moveWithCollision(ctx, (dx / dl) * sp * dt, (dz / dl) * sp * dt)
+            this.yaw = Math.atan2(dx, dz)
+            this.speedNow = sp
+          } else {
+            this.speedNow = 0
+          }
+        }
         if (this.recoverT <= 0) {
           const s = this.target >= 0 ? ctx.survivors[this.target] : null
-          this.state = s && s.alive && !s.incapacitated ? 'chase' : 'patrol'
+          this.state = s && s.alive && !s.incapacitated && !this.isPlayerControlled ? 'chase' : 'patrol'
           this.path = []
           this.repathT = 0
         }
@@ -324,7 +370,11 @@ export class Hunter {
         const s = ctx.survivors[this.carriedId]
         const chair = ctx.world.chairs[this.chairTarget]
         if (!s || !chair || chair.occupiedBy !== -1) {
+          // 椅子失效(已被占用/不存在):必须先放人再回 patrol,否则该求生者永久卡 carried
+          // (incapacitated 恒 true → activeSurvivors 永不为 0 → 游戏永不结算)
+          this.dropCarried(s)
           this.state = 'patrol'
+          this.path = []
           break
         }
         const d = dist(this.x, this.z, chair.x, chair.z)
@@ -333,7 +383,8 @@ export class Hunter {
           this.chairT = 2.0
           this.speedNow = 0
         } else {
-          this.seek(ctx, chair.x, chair.z, SPEED.hunterCarry * this.speedMul, dt)
+          // AI 自动寻路走向椅子;玩家扮演时自己扛着走,只同步被扛者位置
+          if (!this.isPlayerControlled) this.seek(ctx, chair.x, chair.z, SPEED.hunterCarry * this.speedMul, dt)
           // 被扛者跟随
           s.x = this.x - Math.sin(this.yaw) * 0.5
           s.z = this.z - Math.cos(this.yaw) * 0.5
@@ -458,6 +509,322 @@ export class Hunter {
     this.syncMesh(dt, ctx.time)
   }
 
+  // ===== 玩家扮演杀手:动作状态机子集(移动/朝向由 Engine 驱动) =====
+  private updateAsPlayer(ctx: GameCtx, dt: number): void {
+    // 追击加成与 AI 同规则(目标 10m 内每 5s +1 档),否则玩家平地追不上 AI 冲刺
+    const prey = this.findNearestPrey(ctx)
+    this.updateChaseBuff(prey ? prey.dist : null, dt)
+    switch (this.state) {
+      case 'stunned':
+        this.stunT -= dt
+        this.speedNow = 0
+        if (this.stunT <= 0) this.state = 'patrol'
+        break
+      case 'breakpallet': {
+        this.breakT -= dt
+        this.speedNow = 0
+        if (this.breakT <= 0) {
+          const p = ctx.world.pallets[this.breakPalletId]
+          if (p && p.state === 'down') {
+            p.state = 'broken'
+            p.mesh.visible = false
+            ctx.nav.setDynamicAABB(p.collider, false)
+            const cols = ctx.world.colliders
+            for (let i = cols.length - 1; i >= 0; i--) {
+              if (cols[i] === p.collider) cols.splice(i, 1)
+            }
+            ctx.sfx('palletBreak')
+          }
+          this.state = 'patrol'
+        }
+        break
+      }
+      case 'recover': {
+        // 后摇计时(移动由 Engine,60% 速);垂刀动画由 syncMesh 播放,speedNow 保持 Engine 设置值
+        this.recoverT -= dt
+        if (this.recoverT <= 0) this.state = 'patrol'
+        break
+      }
+      case 'pickup': {
+        this.pickupT -= dt
+        this.speedNow = 0
+        if (this.pickupT <= 0) {
+          const s = ctx.survivors[this.target]
+          if (s && s.status === 'downed') {
+            s.status = 'carried'
+            this.carriedId = s.id
+            const chair = ctx.world.nearestFreeChair(this.x, this.z)
+            if (chair) {
+              this.chairTarget = chair.id
+              this.state = 'carry'
+              this.path = []
+              this.repathT = 0
+            } else {
+              ctx.onSurvivorEliminated(s)
+              this.carriedId = -1
+              this.state = 'patrol'
+            }
+          } else {
+            this.state = 'patrol'
+          }
+        }
+        break
+      }
+      case 'carry': {
+        // 移动由 Engine;这里只负责被扛者跟随与到椅自动绑
+        const s = ctx.survivors[this.carriedId]
+        const chair = ctx.world.chairs[this.chairTarget]
+        if (!s || !chair || chair.occupiedBy !== -1) {
+          // 椅子失效(已被占用/不存在):必须先放人再回 patrol,否则该求生者永久卡 carried
+          // (incapacitated 恒 true → activeSurvivors 永不为 0 → 游戏永不结算)
+          this.dropCarried(s)
+          this.state = 'patrol'
+          this.path = []
+          break
+        }
+        if (dist(this.x, this.z, chair.x, chair.z) < 2.0) {
+          this.state = 'chair'
+          this.chairT = 2.0
+          this.speedNow = 0
+        } else {
+          s.x = this.x - Math.sin(this.yaw) * 0.5
+          s.z = this.z - Math.cos(this.yaw) * 0.5
+        }
+        break
+      }
+      case 'chair': {
+        this.chairT -= dt
+        this.speedNow = 0
+        if (this.chairT <= 0) {
+          const s = ctx.survivors[this.carriedId]
+          const chair = ctx.world.chairs[this.chairTarget]
+          if (s && chair) {
+            s.status = 'chaired'
+            s.chairCount++
+            s.chairTimer = s.chairCount >= 3 ? 0 : s.chairCount === 2 ? 40 : 60
+            s.chairRef = chair.id
+            s.x = chair.x
+            s.z = chair.z + 0.1
+            chair.occupiedBy = s.id
+            ctx.onSurvivorChaired(s, chair)
+          }
+          this.carriedId = -1
+          this.target = -1
+          this.state = 'patrol'
+          this.path = []
+        }
+        break
+      }
+      case 'teleport':
+      case 'attack': {
+        // teleport:蓄力→瞬移→后摇(逻辑与 AI 完全一致);attack:前摇计时(移动由 Engine)
+        if (this.state === 'teleport') {
+          this.teleportT -= dt
+          this.speedNow = 0
+          if (this.teleportPhase === 'windup' && this.teleportT <= 0) {
+            this.x = this.teleportTarget.x
+            this.z = this.teleportTarget.z
+            this.path = []
+            this.pathI = 0
+            this.repathT = 0
+            this.teleportPhase = 'after'
+            this.teleportT = this.ai.TELEPORT_AFTER
+            ctx.sfx('teleportBlink')
+          } else if (this.teleportPhase === 'after' && this.teleportT <= 0) {
+            this.teleportPhase = 'none'
+            this.state = 'patrol'
+          }
+        } else {
+          this.attackWindup -= dt
+          if (this.attackWindup <= 0) {
+            this.resolveAttack(ctx)
+            if (this.state === 'attack') {
+              this.state = 'recover'
+              this.recoverT = 0.45
+            }
+          }
+        }
+        break
+      }
+      default: {
+        // 空闲('patrol' 占位)。玩家局【不】自动扛起 —— 由玩家按 E 决定,保留放血战术
+        this.speedNow = 0
+      }
+    }
+    // 野状态兜底:既非 patrol/carry,也不在任何定时动作中 → 强制回 patrol,防状态机死锁
+    if (this.state !== 'patrol' && this.state !== 'carry' && !this.busy()) this.state = 'patrol'
+  }
+
+  // 玩家攻击(左键):朝视角方向,选攻击范围内最近的可打目标(无则空挥,同样进冷却)
+  playerAttack(ctx: GameCtx): boolean {
+    // busy() 不含 'carry',这里显式排除扛人状态(扛着人时不能挥刀)
+    if (this.attackCd > 0 || this.busy() || this.carrying()) return false
+    let best: number = -1
+    let bd = (ATTACK_RANGE + 0.4) * (ATTACK_RANGE + 0.4)
+    for (const s of ctx.survivors) {
+      if (!s.alive || s.incapacitated) continue
+      const d2 = dist2(this.x, this.z, s.x, s.z)
+      if (d2 < bd && this.segmentClear(ctx, this.x, this.z, s.x, s.z)) {
+        bd = d2
+        best = s.id
+      }
+    }
+    this.target = best
+    this.state = 'attack'
+    this.attackWindup = ATTACK_WINDUP
+    this.yaw = Math.atan2(Math.sin(this.yaw), Math.cos(this.yaw)) // 保持当前视角朝向
+    return true
+  }
+
+  // 玩家瞬移(Q):瞬移到最近存活求生者身前(沿其朝向前方),冷却与后摇同 AI
+  playerTeleport(ctx: GameCtx): boolean {
+    if (this.teleportCd > 0 || this.busy() || this.carrying()) return false
+    let best: import('./survivor').Survivor | null = null
+    let bd = Infinity
+    for (const s of ctx.survivors) {
+      if (!s.alive || s.incapacitated) continue
+      const d2 = dist2(this.x, this.z, s.x, s.z)
+      if (d2 < bd) {
+        bd = d2
+        best = s
+      }
+    }
+    if (!best) return false
+    const fx = Math.sin(best.yaw)
+    const fz = Math.cos(best.yaw)
+    let tx = best.x + fx * this.ai.TELEPORT_LEAD_OFFSET
+    let tz = best.z + fz * this.ai.TELEPORT_LEAD_OFFSET
+    if (ctx.nav.blockedAt(tx, tz)) {
+      const cell = ctx.nav.nearestFree(tx, tz, 4)
+      const w = ctx.nav.cellToWorld(cell.cx, cell.cz)
+      tx = w.x
+      tz = w.z
+    }
+    for (const c of ctx.world.colliders) {
+      if (circleHits(tx, tz, 0.45, c)) {
+        const cell = ctx.nav.nearestFree(best.x + 1.2, best.z, 4)
+        const w = ctx.nav.cellToWorld(cell.cx, cell.cz)
+        tx = w.x
+        tz = w.z
+        break
+      }
+    }
+    this.startTeleport(ctx, tx, tz)
+    return true
+  }
+
+  // 玩家破坏倒板(E):附近有放倒的木板则进入破坏
+  playerTryBreak(ctx: GameCtx): boolean {
+    if (this.busy() || this.carrying()) return false
+    for (const p of ctx.world.pallets) {
+      if (p.state !== 'down') continue
+      if (dist(this.x, this.z, p.x, p.z) < 1.9) {
+        this.state = 'breakpallet'
+        this.breakT = 2.0
+        this.breakPalletId = p.id
+        return true
+      }
+    }
+    return false
+  }
+
+  // 玩家翻窗(Space)
+  playerTryVault(ctx: GameCtx): boolean {
+    if (this.busy() || this.carrying()) return false
+    for (const w of ctx.world.windows) {
+      if (dist(this.x, this.z, w.x, w.z) < 1.6) {
+        const off = 1.2
+        const tx = w.axis === 'x' ? w.x + (this.x > w.x ? -off : off) : w.x
+        const tz = w.axis === 'x' ? w.z : w.z + (this.z > w.z ? -off : off)
+        this.vaultT = this.vaultDur
+        this.vaultFrom = { x: this.x, z: this.z }
+        this.vaultTo = { x: tx, z: tz }
+        ctx.sfx('vault')
+        return true
+      }
+    }
+    return false
+  }
+
+  // 玩家扛起(E):2.4m 内倒地的求生者 → 进入 1.3s 扛起动作。
+  // 玩家局刻意不做"击倒即自动扛起",保留放血(slugging)战术选择。
+  playerTryPickup(ctx: GameCtx): boolean {
+    if (this.busy() || this.carrying()) return false
+    let best: import('./survivor').Survivor | null = null
+    let bd = Infinity
+    for (const s of ctx.survivors) {
+      if (s.status !== 'downed') continue
+      const d2 = dist2(this.x, this.z, s.x, s.z)
+      if (d2 < bd) {
+        bd = d2
+        best = s
+      }
+    }
+    if (!best || bd > 2.4 * 2.4) return false
+    this.target = best.id
+    this.state = 'pickup'
+    this.pickupT = 1.3
+    this.speedNow = 0
+    return true
+  }
+
+  // 玩家主动放下(放血):倒地者持续流血且会爬行,逼队友来救 —— 换杀手去追其他人
+  playerDropCarried(ctx: GameCtx): boolean {
+    if (!this.carrying()) return false
+    this.dropCarried(ctx.survivors[this.carriedId])
+    this.state = 'patrol'
+    this.path = []
+    ctx.sfx('vault')
+    return true
+  }
+
+  // 放人通用清理:状态回 downed(可继续爬行),清 id 与目标椅子。
+  // 所有中断扛人的路径(椅子失效 / 被砸板 / 主动放下)都必须走这里,否则求生者永久卡 carried。
+  private dropCarried(s?: Survivor | null): void {
+    if (s && s.status === 'carried') s.status = 'downed'
+    this.carriedId = -1
+    this.chairTarget = -1
+  }
+
+  // 最近的活跃猎物(未被击倒/淘汰/逃脱),用于追击加成、音频与 AI 逃跑判定
+  findNearestPrey(ctx: GameCtx): { id: number; dist: number } | null {
+    let best: number = -1
+    let bd = Infinity
+    for (const s of ctx.survivors) {
+      if (!s.alive || s.incapacitated) continue
+      const d = dist(this.x, this.z, s.x, s.z)
+      if (d < bd) {
+        bd = d
+        best = s.id
+      }
+    }
+    return best >= 0 ? { id: best, dist: bd } : null
+  }
+
+  // 追击速度叠加:目标 10m 内每 5s +1 档(每档 +2%,上限 +10%),脱离范围则按秒衰减。
+  // 从 AI 的 chase() 抽出,玩家操控时同样生效 —— 否则玩家平地追不上 AI 冲刺(6.15 > 6.05)。
+  updateChaseBuff(d: number | null, dt: number): void {
+    if (d !== null && d < this.ai.CHASE_BUFF_RANGE) {
+      this.chaseBuffT += dt
+      if (this.chaseBuffT >= this.ai.CHASE_BUFF_INTERVAL && this.chaseSpeedBuff < this.ai.CHASE_BUFF_MAX_STEPS) {
+        this.chaseBuffT = 0
+        this.chaseSpeedBuff++
+      }
+    } else {
+      this.chaseBuffT = 0
+      this.chaseSpeedBuff = Math.max(0, this.chaseSpeedBuff - dt * this.ai.CHASE_BUFF_DECAY)
+    }
+  }
+
+  get chaseBuffPct(): number {
+    return this.chaseSpeedBuff * this.ai.CHASE_BUFF_STEP
+  }
+
+  // 玩家可自由行动(不受状态机定身、未扛人、不在翻窗中)
+  canAct(): boolean {
+    return !this.busy() && !this.carrying() && this.vaultT <= 0
+  }
+
   private patrol(ctx: GameCtx, dt: number): void {
     if (this.tryAcquire(ctx)) return
     // 附近有倒地幸存者 → 去扛
@@ -537,19 +904,8 @@ export class Hunter {
       return
     }
     const d = dist(this.x, this.z, s.x, s.z)
-    // ---- 追击速度叠加:目标在 10m 内每 5s +2%(上限 +10%),脱离则衰减 ----
-    if (d < this.ai.CHASE_BUFF_RANGE) {
-      this.chaseBuffT += dt
-      if (this.chaseBuffT >= this.ai.CHASE_BUFF_INTERVAL && this.chaseSpeedBuff < this.ai.CHASE_BUFF_MAX_STEPS) {
-        this.chaseBuffT = 0
-        this.chaseSpeedBuff++
-      }
-    } else {
-      // 脱离范围:按秒衰减档数,并重置累计计时
-      this.chaseBuffT = 0
-      const decay = dt * this.ai.CHASE_BUFF_DECAY
-      this.chaseSpeedBuff = Math.max(0, this.chaseSpeedBuff - decay)
-    }
+    // ---- 追击速度叠加:逻辑已抽到 updateChaseBuff,玩家操控时共用同一套规则 ----
+    this.updateChaseBuff(d, dt)
     const seen = !losBlocked(this.x, this.z, s.x, s.z, ctx.world.tallWalls)
     // 移动视线:包含矮墙/窗户等全部碰撞体,用于转向与攻击判定(防止隔墙推墙/隔窗打人)
     const seenMove = this.segmentClear(ctx, this.x, this.z, s.x, s.z)
@@ -749,7 +1105,7 @@ export class Hunter {
   }
 
   private resolveAttack(ctx: GameCtx): void {
-    this.attackCd = 0.8 // 与恢复时长一致(攻击后 0.8s 才能再攻击)
+    this.attackCd = 0.45 // 与后摇时长一致(后摇结束即可再次攻击)
     const s = ctx.survivors[this.target]
     if (!s) return
     const d = dist(this.x, this.z, s.x, s.z)
@@ -757,10 +1113,14 @@ export class Hunter {
       s.hurt(ctx)
       this.sectorFlashT = 0.4 // 命中红光爆闪
       if (s.status === 'downed') {
-        // 捡起
-        this.state = 'pickup'
-        this.pickupT = 1.3
-        this.speedNow = 0
+        if (this.isPlayerControlled) {
+          // 玩家局:只提示,不自动扛起 —— 玩家可以继续追别人,或稍后回来扛(放血战术)
+          ctx.toast(`按 E 扛起 ${s.name}`)
+        } else {
+          this.state = 'pickup'
+          this.pickupT = 1.3
+          this.speedNow = 0
+        }
       }
     }
   }
@@ -838,7 +1198,8 @@ export class Hunter {
   // 碰撞移动:标准 "联合优先 + 分轴滑墙" 算法,修复凹墙角穿透 bug。
   // 旧实现把 X/Z 分开独立检测,斜向撞向凹角时两轴各自都能过 → 角色被推进墙缝。
   // 新实现:先试联合位移(斜向移动顺畅),撞了才退化到单轴滑墙。
-  private moveWithCollision(ctx: GameCtx, dx: number, dz: number): void {
+  // 带碰撞的位移(玩家操控杀手时由 Engine 驱动移动,需对外暴露)
+  moveWithCollision(ctx: GameCtx, dx: number, dz: number): void {
     const r = 0.45
     const cols = ctx.world.colliders
     // 判断目标位置是否与任何碰撞体相撞(且当前位置未重叠——重叠时允许脱离)
@@ -901,15 +1262,11 @@ export class Hunter {
     this.stunT = 2.5
     this.speedNow = 0
     ctx.sfx('palletStun')
-    ctx.toast('猎人被木板砸晕了!')
-    // 扛着人时掉落
-    if (this.carriedId >= 0) {
-      const s = ctx.survivors[this.carriedId]
-      if (s && s.status === 'carried') {
-        s.status = 'downed'
-      }
-      this.carriedId = -1
-    }
+    ctx.toast(this.isPlayerControlled ? '你被木板砸晕了!' : '猎人被木板砸晕了!')
+    // 扛着人时掉落。必须走 dropCarried 保证 status 回 downed 且 chairTarget 一并清空 ——
+    // 只清 carriedId 会留下 chairTarget,下次重新锁定目标时视觉上像"粘住"刚放下的人。
+    if (this.carrying()) this.dropCarried(ctx.survivors[this.carriedId])
+    this.target = -1
   }
 
   private syncMesh(dt: number, time: number): void {

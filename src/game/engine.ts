@@ -8,18 +8,29 @@ import { Qte } from './qte'
 import { Input } from './input'
 import { AudioEngine } from './audio'
 import type { SfxName } from './audio'
-import { NavGrid, circleHits } from './navgrid'
+import { NavGrid, circleHits, losBlocked } from './navgrid'
 import { dist, dist2, clamp } from './types'
-import type { NoiseEvent } from './types'
+import type { NoiseEvent, PlayerRole } from './types'
 import { SPEED } from './context'
 import type { GameCtx } from './context'
 import { getHud, pushToast, resetHud, setHud } from './bridge'
-import type { HudState } from './bridge'
+import type { EndResult, MinimapData, Phase, PromptState } from './bridge'
 import { loadSettings, saveSettings } from './settings'
 import type { Settings } from './settings'
 
-const SURV_COLORS = [0xb0b0d8, 0x8a9a5b, 0xb08355, 0x6b8fa3]
+// 求生者毛衣色(参考图风格:鲜亮换色,每人一眼可辨)
+const SURV_COLORS = [0xd9a13b, 0x4a8fa8, 0xb0563e, 0x6a9955]
 const TERROR_RADIUS = 26
+// 杀手情报半径:感知圈 8m / 噪音波及 5m(超出则小地图上看不到求生者)
+const HUNTER_SENSE_RADIUS = 8
+const HUNTER_NOISE_RADIUS = 5
+// 一局硬性时长上限(秒):任何状态机异常都不得导致永不结算
+const MATCH_TIME_LIMIT = 600
+// AI 名字池(玩家扮演杀手时 4 人全为 AI,需覆盖 id 0..3)
+const AI_NAMES = ['阿岚', '老周', '小七', '阿澈']
+
+// 每帧消费一次的输入快照
+type InputFrame = ReturnType<Input['endFrame']>
 
 export class Engine implements GameCtx {
   world!: World
@@ -29,6 +40,8 @@ export class Engine implements GameCtx {
   noises: NoiseEvent[] = []
   time = 0
   gatePowered = false
+  // 玩家扮演的角色(start 时由菜单选择)
+  playerRole: PlayerRole = 'survivor'
   // 用户设置(灵敏度/音量/难度),从 localStorage 加载,运行时可改
   settings: Settings
 
@@ -52,13 +65,15 @@ export class Engine implements GameCtx {
   private playerChannel = 0 // 救人/治疗/开门吟唱进度
   private channelKind: 'none' | 'rescue' | 'heal' | 'gate' = 'none'
   private channelTarget = -1
-  private stats = { decode: 0, chaseTime: 0, rescues: 0 }
+  private stats = { decode: 0, chaseTime: 0, rescues: 0, downs: 0 }
   private escapedTeammates = 0
+  private kills = 0 // 本局淘汰数(杀手主指标;求生者局仅用于结算展示)
+  private hunterPrompt: PromptState | null = null // 杀手局底部交互提示
   private chaseMusicOn = false
   private spectating = false // 玩家被淘汰后进入观战模式
   private spectateTargetId = -1 // 当前观战的队友 id
   // HUD survivors 缓存:仅在状态变化时重建,避免每帧 .map 产生 GC
-  private hudSurvivorsCache: { name: string; status: import('./types').SurvivorStatus; isPlayer: boolean }[] = []
+  private hudSurvivorsCache: import('./bridge').SurvivorChip[] = []
   private hudSurvivorsKey = ''
 
   constructor(canvas: HTMLCanvasElement, input: Input, audio: AudioEngine) {
@@ -76,11 +91,22 @@ export class Engine implements GameCtx {
     this.resize()
     window.addEventListener('resize', this.resize)
     document.addEventListener('pointerlockchange', this.onLockChange)
+    // Esc 走独立监听:tick 在 paused 时不跑,靠 endFrame() 读 esc 是条死路(暂停后无法用 Esc 恢复)
+    window.addEventListener('keydown', this.escHandler)
+  }
+
+  // Esc:playing↔paused。独立于 Input.enabled 与主循环,两条路径都能触发。
+  private escHandler = (e: KeyboardEvent): void => {
+    if (e.code !== 'Escape') return
+    const phase = getHud().phase
+    if (phase === 'paused') this.resume()
+    else if (phase === 'playing') this.pause()
   }
 
   dispose(): void {
     this.stop()
     window.removeEventListener('resize', this.resize)
+    window.removeEventListener('keydown', this.escHandler)
     document.removeEventListener('pointerlockchange', this.onLockChange)
     this.disposeScene()
     this.renderer.dispose()
@@ -91,10 +117,17 @@ export class Engine implements GameCtx {
       if (o instanceof THREE.Mesh) {
         o.geometry.dispose()
         const m = o.material
-        if (Array.isArray(m)) m.forEach((x) => x.dispose())
-        else m.dispose()
+        if (Array.isArray(m)) m.forEach((x) => this.disposeMaterial(x))
+        else this.disposeMaterial(m)
       }
     })
+  }
+
+  // 释放材质,但跳过模块级共享材质(如透视轮廓 outlineMat)。
+  // 共享材质被 dispose 后,重开一局时受击求生者的穿墙红框高亮会失效 ——
+  // 而那正是杀手局定位猎物的核心情报来源,必须保住。
+  private disposeMaterial(m: THREE.Material): void {
+    if (!(m as THREE.Material & { __shared?: boolean }).__shared) m.dispose()
   }
 
   private buildScene(): void {
@@ -102,25 +135,53 @@ export class Engine implements GameCtx {
     this.world = new World(this.scene)
     this.nav = this.world.nav
     this.survivors = []
-    // 监管者先就位,再用其位置约束求生者刷新(保证开局距离 > 12m)
+    const isHunter = this.playerRole === 'hunter'
+    // 监管者先就位,再用其位置约束求生者刷新(保证开局距离 > 12m)。
+    // 玩家扮演杀手时固定用 normal 难度构造:难度只调节 AI 强度,不该给玩家白送移速加成。
     const HUNTER_X = -8
     const HUNTER_Z = -30
-    this.hunter = new Hunter(HUNTER_X, HUNTER_Z, this.settings.difficulty)
+    this.hunter = new Hunter(HUNTER_X, HUNTER_Z, isHunter ? 'normal' : this.settings.difficulty)
+    this.hunter.setPlayerControlled(isHunter)
+    // 猎灯:猎人本身不带提灯,玩家扮演时必须点亮,否则全场只剩求生者的微弱提灯(近乎全黑)
+    if (this.hunter.mesh.huntLight) this.hunter.mesh.huntLight.visible = isHunter
     this.scene.add(this.hunter.mesh.group)
     // 求存者随机刷新:全图 ±30 范围内随机,拒绝墙内/距猎人<12m/彼此<3m 的点
     const spawns = this.rollSurvivorSpawns(HUNTER_X, HUNTER_Z)
+    let aiNameIdx = 0
     for (let i = 0; i < 4; i++) {
-      const s = new Survivor(i, i === 0, spawns[i][0], spawns[i][1], SURV_COLORS[i])
+      // 玩家扮演求生者时 0 号是"你";扮演杀手时 4 人全为 AI
+      const isPlayer = !isHunter && i === 0
+      const s = new Survivor(
+        i,
+        isPlayer,
+        spawns[i][0],
+        spawns[i][1],
+        SURV_COLORS[i],
+        // 显式传名:避免 Survivor 内部用 AI_NAMES[(id-1)%3] 在 id=0 时取到 undefined
+        isPlayer ? '你' : AI_NAMES[aiNameIdx++],
+      )
+      if (isHunter) {
+        // 杀手视角下要能看清猎物:把 AI 提灯调亮。
+        // 必须改 lanternBase 而非 intensity —— syncMesh 每帧用 base 重算 intensity 会覆盖直接赋值。
+        s.mesh.lanternBase = 3.2
+        if (s.mesh.lanternLight) s.mesh.lanternLight.distance = 14
+      }
       this.survivors.push(s)
       this.scene.add(s.mesh.group)
     }
     Survivor.staticColliders = this.world.colliders
+    // 杀手局:放缓 AI 破译(70s → 95s/台),并让破译产生噪音作为杀手的情报来源。
+    // 否则 4 人并行约 110s 就能全员逃脱,杀手根本没有 3 杀的窗口。
+    Survivor.staticDecodeTime = isHunter ? 95 : 70
+    Survivor.staticDecodeNoise = isHunter
     this.noises = []
     this.time = 0
     this.gatePowered = false
     this.qte = new Qte()
-    this.stats = { decode: 0, chaseTime: 0, rescues: 0 }
+    this.stats = { decode: 0, chaseTime: 0, rescues: 0, downs: 0 }
     this.escapedTeammates = 0
+    this.kills = 0
+    this.hunterPrompt = null
     this.over = false
     this.spectating = false
     this.spectateTargetId = -1
@@ -163,17 +224,26 @@ export class Engine implements GameCtx {
   }
 
   // ---- 生命周期 ----
-  start(): void {
+  // role 缺省时沿用上一局的选择(结算页"再来一局"不传参)
+  start(role?: PlayerRole): void {
+    if (role) this.playerRole = role
+    // 丢弃菜单期累积的输入:点"开始游戏"的 mousedown 会被记为攻击,开局瞬间白挥一刀
+    this.input.endFrame()
     this.disposeScene()
     this.buildScene()
     resetHud()
     this.audio.ensure()
     setHud({
       phase: 'playing',
-      survivors: this.survivors.map((s) => ({ name: s.name, status: s.status, isPlayer: s.isPlayer })),
+      // resetHud() 会把 role 重置回 'survivor',必须在它之后再写入本次选择
+      role: this.playerRole,
+      hunterState: this.playerRole === 'hunter' ? 'patrol' : null,
+      survivors: this.getHudSurvivors(),
       ciphersLeft: 5,
       gatePowered: false,
       muted: this.audio.isMuted,
+      kills: 0,
+      stats: { decode: 0, chaseTime: 0, rescues: 0, downs: 0, kills: 0 },
     })
     this.input.enabled = true
     this.input.requestLock()
@@ -201,9 +271,22 @@ export class Engine implements GameCtx {
     this.audio.setHum(false)
   }
 
+  // 回到主菜单(结算页"返回菜单"):停掉本局并释放指针锁定,以便重新选择角色。
+  // 没有它,玩家想从杀手切回求生者只能刷新页面。
+  backToMenu(): void {
+    this.stop()
+    this.over = true // 冻结本局;下次 start() 会由 buildScene 重置
+    this.spectating = false
+    resetHud() // 回到 initial,phase 即为 'menu'
+  }
+
   resume(): void {
     if (this.over) return
     this.paused = false
+    this.input.enabled = true
+    // 丢弃暂停期间累积的输入:点"继续"按钮的 mousedown 会被记成攻击,
+    // 恢复后第一帧就消费 → 杀手凭空挥一刀并进入 0.45s 后摇。
+    this.input.endFrame()
     setHud({ phase: 'playing' })
     this.input.requestLock()
   }
@@ -211,6 +294,7 @@ export class Engine implements GameCtx {
   pause(): void {
     if (this.over || getHud().phase !== 'playing') return
     this.paused = true
+    this.input.enabled = false
     setHud({ phase: 'paused' })
     this.input.exitLock()
     this.audio.setChase(false)
@@ -265,8 +349,15 @@ export class Engine implements GameCtx {
     this.audio[name]()
   }
 
+  // 是否被猎人追杀(驱动 AI 求生者的逃跑/冲刺决策与追击音乐)
   isChased(s: Survivor): boolean {
-    return this.hunter.state === 'chase' && this.hunter.target === s.id
+    const h = this.hunter
+    // 玩家扮演杀手时状态机永不进入 'chase',改用"锁定 + 距离"判定 ——
+    // 否则 AI 求生者被贴脸也不交冲刺,追击音乐也永远不响。
+    if (h.isPlayerControlled) {
+      return h.target === s.id && !h.busy() && !h.carrying() && dist2(s.x, s.z, h.x, h.z) < 20 * 20
+    }
+    return h.state === 'chase' && h.target === s.id
   }
 
   onCipherDone(c: Cipher): void {
@@ -290,6 +381,7 @@ export class Engine implements GameCtx {
 
   onSurvivorDowned(s: Survivor): void {
     this.toast(s.isPlayer ? '你被打倒了!' : `${s.name} 被打倒了!`, true)
+    if (this.playerRole === 'hunter') this.stats.downs++
     if (s.isPlayer) this.qte.cancel()
   }
 
@@ -310,6 +402,7 @@ export class Engine implements GameCtx {
   onSurvivorEliminated(s: Survivor): void {
     if (s.status === 'eliminated') return
     s.status = 'eliminated'
+    this.kills++ // 放在幂等守卫之后,避免重复计数
     if (s.chairRef >= 0) {
       const ch = this.world.chairs[s.chairRef]
       if (ch) ch.occupiedBy = -1
@@ -413,23 +506,44 @@ export class Engine implements GameCtx {
     }
   }
 
+  // won 仅对求生者局有意义(玩家逃脱 = 胜);杀手局的胜负由 kills 推导。
   private endGame(won: boolean, reason: string): void {
     if (this.over) return
     this.over = true
     this.audio.setChase(false)
     this.audio.setHum(false)
-    if (won) this.audio.win()
-    else this.audio.lose()
     this.input.exitLock()
-    // 结算:队友逃脱数(已逃脱 + 若玩家胜利时仍在场上的视为未逃脱)
+
+    let result: EndResult
+    if (this.playerRole === 'hunter') {
+      // 杀手判定:4~3 淘汰 = 狩猎完成,2 淘汰 = 平局,1 及以下 = 失败
+      const escaped = this.survivors.filter((s) => s.status === 'escaped').length
+      result = this.kills >= 3 ? 'win' : this.kills === 2 ? 'draw' : 'lose'
+      reason =
+        result === 'win'
+          ? `你淘汰了 ${this.kills} 名求生者,狩猎完成。`
+          : result === 'draw'
+            ? `2 淘汰 · ${escaped} 逃脱,平局。`
+            : `只淘汰了 ${this.kills} 人,${escaped} 人逃出了庄园。`
+    } else {
+      result = won ? 'win' : 'lose'
+    }
+    if (result === 'win') this.audio.win()
+    else this.audio.lose()
+
+    const phase: Phase = result === 'win' ? 'won' : result === 'draw' ? 'draw' : 'lost'
     setHud({
-      phase: won ? 'won' : 'lost',
+      phase,
       endReason: reason,
+      endResult: result,
       escapedTeammates: this.escapedTeammates,
+      kills: this.kills,
       stats: {
         decode: Math.round(this.stats.decode * 100),
         chaseTime: Math.round(this.stats.chaseTime),
         rescues: this.stats.rescues,
+        downs: this.stats.downs,
+        kills: this.kills,
       },
     })
   }
@@ -438,22 +552,21 @@ export class Engine implements GameCtx {
   private tick(dt: number): void {
     this.time += dt
     const p = this.survivors[0]
+    const h = this.hunter
+    const isHunter = this.playerRole === 'hunter'
 
-    // 噪音衰减
+    // 噪音衰减(两角色共用)
     for (let i = this.noises.length - 1; i >= 0; i--) {
       this.noises[i].ttl -= dt
       if (this.noises[i].ttl <= 0) this.noises.splice(i, 1)
     }
 
+    // Esc 已改由独立的 window keydown 监听处理 —— 暂停时 tick 不跑,这里读不到
     const frame = this.input.endFrame()
     if (frame.m) this.toggleMute()
-    // Esc:playing↔paused 切换(playing→pause 主要由 pointerlockchange 兜底,这里补 paused→resume)
-    if (frame.esc) {
-      const phase = getHud().phase
-      if (phase === 'paused') this.resume()
-    }
-    // 玩家冲刺技能(Q):玩家朝相机朝向方向冲(比 yaw 更直观)
-    if (frame.q && p.canDash()) {
+
+    // 求生者冲刺技能(Q)。杀手的 Q 是瞬移,在 updatePlayerHunter 内消费。
+    if (!isHunter && frame.q && p.canDash()) {
       const sin = Math.sin(this.camYaw)
       const cos = Math.cos(this.camYaw)
       // 相机前方 = (sin, cos);取玩家当前移动方向,无输入则用相机前方
@@ -467,101 +580,308 @@ export class Engine implements GameCtx {
       p.startDash(this, dx, dz)
     }
 
+    // ── 1. 玩家输入与移动 ──
+    // 必须排在 h.update() 之前:playerTryVault 设置的 vaultT 要在本帧就被
+    // hunter.update() 开头的插值分支消费,否则玩家在翻窗期间仍会被 Engine 推动。
+    if (isHunter) this.updatePlayerHunter(dt, frame)
+
+    // ── 2. 实体更新 ──
     if (!this.over) {
-      this.updatePlayer(p, dt, frame.dx, frame.dy, frame.space)
-      for (let i = 1; i < this.survivors.length; i++) this.survivors[i].update(this, dt)
-      this.hunter.update(this, dt)
+      if (isHunter) {
+        // 玩家扮演杀手:4 名求生者【全部】走 AI。不能沿用 i=1 起始,否则漏掉 0 号。
+        for (let i = 0; i < this.survivors.length; i++) this.survivors[i].update(this, dt)
+        this.updateHunterTarget()
+        h.update(this, dt)
+      } else {
+        this.updatePlayer(p, dt, frame.dx, frame.dy, frame.space)
+        for (let i = 1; i < this.survivors.length; i++) this.survivors[i].update(this, dt)
+        this.hunter.update(this, dt)
+      }
       this.world.update(dt, this.time)
-      // 队友上椅的椅子:对玩家透视高亮(自己上椅不高亮)
+      // 椅子透视高亮:求生者局高亮队友;杀手局高亮所有上椅者(便于守椅)
       for (const ch of this.world.chairs) {
         const occ = ch.occupiedBy >= 0 ? this.survivors[ch.occupiedBy] : null
-        const show = !!occ && !occ.isPlayer && occ.status === 'chaired'
+        const show = !!occ && occ.status === 'chaired' && (isHunter || !occ.isPlayer)
         if (ch.highlight.visible !== show) ch.highlight.visible = show
       }
-      // 终局判定:场上无存活的求生者(全淘汰/逃脱)→ 猎人胜
+      // ── 3. 终局判定 ──
       const activeSurvivors = this.survivors.filter((s) => s.alive).length
-      if (activeSurvivors === 0 && !this.over) {
+      if (isHunter) {
+        const escaped = this.survivors.filter((s) => s.status === 'escaped').length
+        // 全灭即结束;已 3 人逃脱且场上剩 ≤1 人时最多再拿 1 杀(必负),提前结算避免干等
+        if (activeSurvivors === 0 || (escaped >= 3 && activeSurvivors <= 1 && !h.carrying())) {
+          this.endGame(false, '')
+        } else if (this.time > MATCH_TIME_LIMIT) {
+          // 保险丝:任何状态机异常(如求生者卡在 carried)都不得导致永不结算
+          this.endGame(false, '达到时长上限,本局结束。')
+        }
+      } else if (activeSurvivors === 0 && !this.over) {
         const playerEliminated = !p.alive
         this.endGame(playerEliminated, playerEliminated ? '全员被淘汰,猎人获胜。' : '')
       }
     }
 
-    // 音频层
-    const hd = dist(p.x, p.z, this.hunter.x, this.hunter.z)
-    const terror = p.alive && !this.over ? clamp(1 - hd / TERROR_RADIUS, 0, 1) : 0
+    // ── 4. 音频层 ──
+    let terror = 0
+    let chased = false
+    if (isHunter) {
+      // 杀手没有心跳;terror 通道改传"猎物接近度"(同样 0..1),驱动暗金暗角与追击音乐
+      const prey = h.findNearestPrey(this)
+      terror = prey && !this.over ? clamp(1 - prey.dist / 16, 0, 1) : 0
+      chased = !!prey && prey.dist < 12 && !h.carrying() && !this.over
+      this.audio.setHum(false)
+    } else {
+      const hd = dist(p.x, p.z, h.x, h.z)
+      terror = p.alive && !this.over ? clamp(1 - hd / TERROR_RADIUS, 0, 1) : 0
+      chased = this.isChased(p) && p.alive && !this.over
+      this.audio.setHum(this.isPlayerDecoding(p))
+    }
     this.audio.update(dt, terror)
-    const chased = this.isChased(p) && p.alive && !this.over
     if (chased !== this.chaseMusicOn) {
       this.chaseMusicOn = chased
       this.audio.setChase(chased)
     }
-    this.audio.setHum(this.isPlayerDecoding(p))
 
-    // 相机
-    this.updateCamera(p, dt)
+    // ── 5. 相机 ──
+    this.updateCamera(dt)
 
-    // HUD
+    // ── 6. HUD 推送(先推共享项,再按角色分流)──
     const overall =
       this.world.ciphers.reduce((acc, c) => acc + (c.done ? 1 : c.progress), 0) / this.world.ciphers.length
-    setHud({
-      terror,
-      overall,
-      chase: chased,
-      playerStatus: p.status,
-      stamina: p.stamina,
-      dashCd: p.dashCd,
-      healProgress: p.healProgress > 0 && p.healProgress < 1 ? p.healProgress : -1,
-      chairTimeLeft: p.status === 'chaired' ? Math.max(0, p.chairTimer) : -1,
-      survivors: this.getHudSurvivors(),
-      qte: this.qte.active
-        ? { needle: this.qte.needle, zoneStart: this.qte.zoneStart, zoneSize: this.qte.zoneSize }
-        : null,
-      stats: {
-        decode: Math.round(this.stats.decode * 100),
-        chaseTime: Math.round(this.stats.chaseTime),
-        rescues: this.stats.rescues,
-      },
-      minimap: this.buildMinimap(p, terror),
-    })
+    setHud({ overall, terror, chase: chased, survivors: this.getHudSurvivors() })
+    if (isHunter) {
+      const chair = h.carrying() && h.chairTarget >= 0 ? this.world.chairs[h.chairTarget] : null
+      const carried = h.carrying() ? this.survivors[h.carriedId] : null
+      setHud({
+        role: 'hunter',
+        hunterState: h.state,
+        attackCd: h.attackCd,
+        teleportCd: h.teleportCd,
+        chaseBuff: h.chaseBuffPct,
+        carryName: carried ? carried.name : null,
+        carryChairDist: chair ? dist(h.x, h.z, chair.x, chair.z) : -1,
+        kills: this.kills,
+        prompt: this.hunterPrompt,
+        // 求生者专属项在杀手局一律置空(避免结算前残留上一局的值)
+        playerStatus: 'healthy',
+        stamina: 1,
+        dashCd: 0,
+        qte: null,
+        chairTimeLeft: -1,
+        healProgress: -1,
+        stats: { decode: 0, chaseTime: 0, rescues: 0, downs: this.stats.downs, kills: this.kills },
+        minimap: this.buildMinimapHunter(),
+      })
+    } else {
+      setHud({
+        role: 'survivor',
+        hunterState: null,
+        playerStatus: p.status,
+        stamina: p.stamina,
+        dashCd: p.dashCd,
+        healProgress: p.healProgress > 0 && p.healProgress < 1 ? p.healProgress : -1,
+        chairTimeLeft: p.status === 'chaired' ? Math.max(0, p.chairTimer) : -1,
+        qte: this.qte.active
+          ? { needle: this.qte.needle, zoneStart: this.qte.zoneStart, zoneSize: this.qte.zoneSize }
+          : null,
+        stats: {
+          decode: Math.round(this.stats.decode * 100),
+          chaseTime: Math.round(this.stats.chaseTime),
+          rescues: this.stats.rescues,
+          downs: this.stats.downs,
+          kills: this.kills,
+        },
+        minimap: this.buildMinimapSurvivor(p, terror),
+      })
+    }
 
-    // 灯光裁剪:距玩家 > 18m 的可裁剪光源关闭,避免超 GPU 光源上限导致远处灯光闪烁
-    this.cullLights(p)
+    // ── 7. 灯光裁剪 + 渲染(杀手视野更广)──
+    this.cullLights(isHunter ? h.x : p.x, isHunter ? h.z : p.z, isHunter ? 22 : 18)
 
     this.renderer.render(this.scene, this.camera)
   }
 
-  // 灯光裁剪:只保留距玩家 18m 内的可裁剪光源,其余关闭
+  // ---- 玩家扮演杀手:输入、移动、提示 ----
+  private updatePlayerHunter(dt: number, f: InputFrame): void {
+    const h = this.hunter
+
+    // 1) 相机旋转(与求生者一致,受鼠标灵敏度设置影响)
+    const sens = this.settings.mouseSens
+    this.camYaw -= f.dx * 0.0024 * sens
+    this.camPitch = clamp(this.camPitch - f.dy * 0.0022 * sens, -1.15, 0.5)
+
+    // 2) 朝向恒等于视角朝向:保证"攻击方向 = 视角方向",扛人跟随也以 yaw 为准。
+    //    移动时【不再】覆盖 yaw,否则攻击朝向会跟着移动方向偏。
+    h.yaw = this.camYaw
+
+    // 3) 边沿输入:扛人时 E 语义变为"放下(放血)",其余动作整体禁用
+    if (h.carrying()) {
+      if (f.e) h.playerDropCarried(this)
+    } else if (h.canAct()) {
+      if (f.atk) h.playerAttack(this) // 左键:挥刀(内部有 attackCd 守卫)
+      if (f.q && h.playerTeleport(this)) this.toast('瞬移!')
+      // E 上下文判定:优先扛起倒地者,其次破坏倒下的木板
+      if (f.e && !h.playerTryPickup(this)) h.playerTryBreak(this)
+      if (f.space) h.playerTryVault(this) // Space:翻窗(倒板只能破坏,不可翻越)
+    }
+
+    // 4) 移动:速度倍率随状态机变化
+    let mul = 1
+    if (h.busy() || h.vaultT > 0) mul = 0 // 眩晕/破板/扛起/挂椅/瞬移/翻窗 → 定身
+    else if (h.state === 'attack') mul = 0.5 // 前摇:半速逼近
+    else if (h.state === 'recover') mul = 0.6 // 后摇:60% 速
+
+    const ax = this.input.axis()
+    const len = Math.hypot(ax.x, ax.z)
+    if (len > 0 && mul > 0) {
+      const sin = Math.sin(this.camYaw)
+      const cos = Math.cos(this.camYaw)
+      // 屏幕右 = (-cos, sin);前方 = (sin, cos)
+      const wx = (-ax.x * cos - ax.z * sin) / len
+      const wz = ax.x * sin - ax.z * cos
+      const sp = h.carrying() ? SPEED.hunterPlayerCarry : h.playerMoveSpeed() * mul
+      h.moveWithCollision(this, wx * sp * dt, wz * sp * dt)
+      h.speedNow = sp
+    } else {
+      h.speedNow = 0
+    }
+
+    // 5) 底部交互提示
+    this.updateHunterPrompt(h)
+  }
+
+  // 维护 hunter.target:驱动 AI 求生者的逃跑/冲刺决策与追击音乐。
+  // 不能在 busy()/扛人时覆盖,否则会打乱攻击与扛人已锁定的目标。
+  private updateHunterTarget(): void {
+    const h = this.hunter
+    if (h.busy() || h.carrying()) return
+    let best = -1
+    let bd = 22 * 22
+    for (const s of this.survivors) {
+      if (!s.alive || s.incapacitated) continue
+      if (losBlocked(h.x, h.z, s.x, s.z, this.world.tallWalls)) continue
+      const d2 = dist2(h.x, h.z, s.x, s.z)
+      if (d2 < bd) {
+        bd = d2
+        best = s.id
+      }
+    }
+    h.target = best
+  }
+
+  private updateHunterPrompt(h: Hunter): void {
+    const set = (text: string, progress: number | null = null): void => {
+      this.hunterPrompt = { text, progress }
+    }
+    if (h.carrying()) {
+      const s = this.survivors[h.carriedId]
+      const ch = h.chairTarget >= 0 ? this.world.chairs[h.chairTarget] : null
+      set(
+        ch
+          ? `扛着 ${s ? s.name : '求生者'} — 前往狂欢之椅 (${Math.round(dist(h.x, h.z, ch.x, ch.z))}m) · 按 E 放下(放血)`
+          : `扛着 ${s ? s.name : '求生者'} — 附近没有空椅子`,
+      )
+      return
+    }
+    if (h.state === 'breakpallet') return set('破坏木板中…', 1 - h.breakT / 2.0)
+    if (h.state === 'pickup') return set('扛起中…', 1 - h.pickupT / 1.3)
+    if (h.state === 'chair') return set('绑上狂欢之椅…', 1 - h.chairT / 2.0)
+    if (h.state === 'stunned') return set(`被木板砸晕 ${h.stunT.toFixed(1)}s`)
+    if (h.state === 'teleport') return set(h.teleportPhase === 'windup' ? '瞬移蓄力…' : '瞬移后摇…')
+    // 情境提示(优先级:倒地者 > 倒板 > 窗户)
+    for (const s of this.survivors) {
+      if (s.status === 'downed' && dist2(h.x, h.z, s.x, s.z) < 2.4 * 2.4) return set(`按 E 扛起 ${s.name}`)
+    }
+    for (const pl of this.world.pallets) {
+      if (pl.state === 'down' && dist(h.x, h.z, pl.x, pl.z) < 1.9) return set('按 E 破坏木板')
+    }
+    for (const w of this.world.windows) {
+      if (dist(h.x, h.z, w.x, w.z) < 1.6) return set('按 Space 翻越窗户')
+    }
+    this.hunterPrompt = null
+  }
+
+  // 杀手情报规则:求生者仅在「受击流血中 / 噪音波及 / 近距离感知圈内」才暴露在小地图上。
+  // 全图透视会让杀手过强,与"躲藏 — 搜寻"的核心张力冲突。
+  private isPreyVisible(s: Survivor): boolean {
+    const h = this.hunter
+    if (s.revealT > 0) return true // 受击后 5s 透视(同时有穿墙红框)
+    if (dist2(s.x, s.z, h.x, h.z) < HUNTER_SENSE_RADIUS * HUNTER_SENSE_RADIUS) return true
+    for (const no of this.noises) {
+      if (dist2(s.x, s.z, no.x, no.z) < HUNTER_NOISE_RADIUS * HUNTER_NOISE_RADIUS) return true
+    }
+    return false
+  }
+
+  // 灯光裁剪:只保留距镜头 18m(求生者)/ 22m(杀手)内的可裁剪光源,其余关闭
   // (玩家提灯不在此列,始终亮)。限制同时点亮的 PointLight 数量,防远处灯光争抢槽位闪烁。
-  private cullLights(p: Survivor): void {
-    const MAX_DIST = 18
-    const MAX_DIST2 = MAX_DIST * MAX_DIST
+  // 杀手视野更广:他是主动搜寻的一方,需要看得更远。
+  private cullLights(x: number, z: number, maxDist = 18): void {
+    const maxDist2 = maxDist * maxDist
     for (const cl of this.world.cullableLights) {
-      const on = dist2(p.x, p.z, cl.x, cl.z) < MAX_DIST2
+      const on = dist2(x, z, cl.x, cl.z) < maxDist2
       if (cl.light.visible !== on) cl.light.visible = on
     }
   }
 
-  // 获取 HUD 幸存者列表(带缓存):仅在某人状态变化时重建数组,避免每帧 .map 产生 GC
-  private getHudSurvivors(): { name: string; status: import('./types').SurvivorStatus; isPlayer: boolean }[] {
-    const key = this.survivors.map((s) => s.status).join(',')
+  // 获取 HUD 幸存者列表(带缓存):仅在某人状态变化时重建数组,避免每帧 .map 产生 GC。
+  // key 里的上椅倒计时取整秒,保证每秒才重建一次(否则浮点每帧变化会让缓存彻底失效)。
+  private getHudSurvivors(): import('./bridge').SurvivorChip[] {
+    const key = this.survivors
+      .map((s) => `${s.status}|${s.chairCount}|${s.status === 'chaired' ? Math.ceil(s.chairTimer) : ''}`)
+      .join(',')
     if (key === this.hudSurvivorsKey) return this.hudSurvivorsCache
     this.hudSurvivorsKey = key
-    this.hudSurvivorsCache = this.survivors.map((s) => ({ name: s.name, status: s.status, isPlayer: s.isPlayer }))
+    this.hudSurvivorsCache = this.survivors.map((s) => ({
+      name: s.name,
+      status: s.status,
+      isPlayer: s.isPlayer,
+      chairCount: s.chairCount,
+      chairTimer: s.status === 'chaired' ? Math.ceil(s.chairTimer) : undefined,
+    }))
     return this.hudSurvivorsCache
   }
 
-  // 构建小地图数据:坐标归一化到 -1..1。监管者仅在心跳范围内显示(避免全图透视)。
-  private buildMinimap(p: Survivor, terror: number): NonNullable<HudState['minimap']> {
+  // 小地图(求生者视角):坐标归一化到 -1..1。监管者仅在心跳范围内显示(避免全图透视)。
+  private buildMinimapSurvivor(p: Survivor, terror: number): MinimapData {
     const n = (v: number): number => (v + 35) / 70 * 2 - 1
     return {
+      self: p.alive ? { x: n(p.x), z: n(p.z) } : null,
       player: p.alive ? { x: n(p.x), z: n(p.z) } : null,
       mates: this.survivors
         .filter((s) => !s.isPlayer && s.alive)
         .map((s) => ({ x: n(s.x), z: n(s.z) })),
-      ciphers: this.world.ciphers.map((c) => ({ x: n(c.x), z: n(c.z), done: c.done })),
+      prey: [],
+      noises: [],
+      chairTarget: null,
+      ciphers: this.world.ciphers.map((c) => ({ x: n(c.x), z: n(c.z), done: c.done, progress: c.progress })),
       chairs: this.world.chairs.map((c) => ({ x: n(c.x), z: n(c.z), occupied: c.occupiedBy !== -1 })),
       gates: this.world.gates.map((g) => ({ x: n(g.x), z: n(g.z), opened: g.opened || g.opening })),
       hunter: terror > 0.1 ? { x: n(this.hunter.x), z: n(this.hunter.z) } : null,
+    }
+  }
+
+  // 小地图(杀手视角):自己是猎人恒可见;求生者仅在 isPreyVisible 成立时出现。
+  // 密码机带 progress 让杀手看出哪台快破完 —— 这是他决定"去哪守"的主要依据。
+  private buildMinimapHunter(): MinimapData {
+    const n = (v: number): number => (v + 35) / 70 * 2 - 1
+    const h = this.hunter
+    return {
+      self: { x: n(h.x), z: n(h.z) },
+      player: null,
+      mates: [],
+      prey: this.survivors
+        .filter((s) => s.alive && this.isPreyVisible(s))
+        .map((s) => ({ x: n(s.x), z: n(s.z), bleeding: s.revealT > 0 })),
+      noises: this.noises.map((no) => ({ x: n(no.x), z: n(no.z), k: clamp(no.ttl / 6, 0, 1) })),
+      chairTarget:
+        h.carrying() && h.chairTarget >= 0
+          ? { x: n(this.world.chairs[h.chairTarget].x), z: n(this.world.chairs[h.chairTarget].z) }
+          : null,
+      ciphers: this.world.ciphers.map((c) => ({ x: n(c.x), z: n(c.z), done: c.done, progress: c.progress })),
+      chairs: this.world.chairs.map((c) => ({ x: n(c.x), z: n(c.z), occupied: c.occupiedBy !== -1 })),
+      gates: this.world.gates.map((g) => ({ x: n(g.x), z: n(g.z), opened: g.opened || g.opening })),
+      hunter: null,
     }
   }
 
@@ -698,7 +1018,7 @@ export class Engine implements GameCtx {
           tx = w.x
           tz = w.z + (p.z > w.z ? -off : off)
         }
-        p.startVault(tx, tz, 1.2)
+        p.startVault(tx, tz, 0.9)
         this.sfx('vault')
         return true
       }
@@ -719,7 +1039,7 @@ export class Engine implements GameCtx {
           tx = pl.x + (p.x > pl.x ? -off : off)
           tz = pl.z
         }
-        p.startVault(tx, tz, 1.2)
+        p.startVault(tx, tz, 0.9)
         this.sfx('vault')
         return true
       }
@@ -732,13 +1052,8 @@ export class Engine implements GameCtx {
       if (pl.state !== 'up') continue
       if (dist(p.x, p.z, pl.x, pl.z) < 1.9) {
         pl.state = 'down'
-        // 放倒表现:沿长轴放平为低矮长条屏障,仍横跨门洞
-        if (pl.axis === 'z') {
-          pl.mesh.rotation.z = Math.PI / 2
-        } else {
-          pl.mesh.rotation.x = Math.PI / 2
-        }
-        pl.mesh.position.y = 0.1
+        // 倒下过渡动画:碰撞立即生效,视觉由 world.update 补间 pivot 旋转
+        pl.fallT = pl.fallDur
         this.world.colliders.push(pl.collider)
         this.nav.setDynamicAABB(pl.collider, true)
         // 玩家若站在板内,推到较近一侧,避免卡进碰撞体
@@ -930,7 +1245,8 @@ export class Engine implements GameCtx {
     }
   }
 
-  private updateCamera(p: Survivor, dt: number): void {
+  // 相机三分流:观战 → 杀手 → 求生者
+  private updateCamera(dt: number): void {
     // 观战模式:跟随当前观战目标(存活队友),自动旋转角度
     if (this.spectating) {
       const target =
@@ -960,13 +1276,16 @@ export class Engine implements GameCtx {
       cam.lookAt(focus.x, 1.2, focus.z)
       return
     }
-    const distBack = 4.6
-    const height = 2.1
+    // 杀手视角:猎人比求生者高(2.3m vs 1.75m),镜头相应拉远抬高
+    const isHunter = this.playerRole === 'hunter'
+    const focus = isHunter ? this.hunter : this.survivors[0]
+    const distBack = isHunter ? 5.2 : 4.6
+    const height = isHunter ? 2.5 : 2.1
     const sin = Math.sin(this.camYaw)
     const cos = Math.cos(this.camYaw)
     const pitchLift = Math.sin(-this.camPitch) * 2.2
-    const tx = p.x - sin * distBack
-    const tz = p.z - cos * distBack
+    const tx = focus.x - sin * distBack
+    const tz = focus.z - cos * distBack
     const cx = clamp(tx, -34.4, 34.4)
     const cz = clamp(tz, -34.4, 34.4)
     const cy = Math.max(0.6, height + pitchLift)
@@ -975,7 +1294,8 @@ export class Engine implements GameCtx {
     cam.position.x += (cx - cam.position.x) * k
     cam.position.y += (cy - cam.position.y) * k
     cam.position.z += (cz - cam.position.z) * k
-    const lookY = p.status === 'downed' ? 0.6 : 1.4
-    cam.lookAt(p.x + sin * 1.2, lookY, p.z + cos * 1.2)
+    // 杀手看向平视略高;求生者倒地时压低视线
+    const lookY = isHunter ? 1.6 : this.survivors[0].status === 'downed' ? 0.6 : 1.4
+    cam.lookAt(focus.x + sin * 1.2, lookY, focus.z + cos * 1.2)
   }
 }

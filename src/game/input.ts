@@ -7,7 +7,9 @@ export class Input {
   eHeld = false
   escPressed = false
   mPressed = false
-  qPressed = false // 技能键:求生者冲刺
+  qPressed = false // 技能键:求生者冲刺 / 杀手瞬移
+  attackPressed = false // 鼠标左键:杀手攻击
+  ePressed = false // E 键边沿(杀手需要:扛起/破坏/放下);求生者继续用持续态 eHeld
   private canvas: HTMLCanvasElement | null = null
   enabled = false
 
@@ -18,7 +20,10 @@ export class Input {
       if (!this.keys.has('Space')) this.spacePressed = true
       e.preventDefault()
     }
-    if (k === 'KeyE') this.eHeld = true
+    if (k === 'KeyE') {
+      if (!this.keys.has('KeyE')) this.ePressed = true
+      this.eHeld = true
+    }
     if (k === 'Escape') this.escPressed = true
     if (k === 'KeyM') this.mPressed = true
     if (k === 'KeyQ') {
@@ -41,17 +46,24 @@ export class Input {
     }
   }
 
+  private onMouseDown = (e: MouseEvent): void => {
+    if (!this.enabled) return
+    if (e.button === 0) this.attackPressed = true // 左键:杀手攻击
+  }
+
   attach(canvas: HTMLCanvasElement): void {
     this.canvas = canvas
     window.addEventListener('keydown', this.onKeyDown)
     window.addEventListener('keyup', this.onKeyUp)
     window.addEventListener('mousemove', this.onMouseMove)
+    window.addEventListener('mousedown', this.onMouseDown)
   }
 
   detach(): void {
     window.removeEventListener('keydown', this.onKeyDown)
     window.removeEventListener('keyup', this.onKeyUp)
     window.removeEventListener('mousemove', this.onMouseMove)
+    window.removeEventListener('mousedown', this.onMouseDown)
   }
 
   requestLock(): void {
@@ -80,7 +92,16 @@ export class Input {
   }
 
   // 每帧末尾调用,消费边沿量
-  endFrame(): { dx: number; dy: number; space: boolean; esc: boolean; m: boolean; q: boolean } {
+  endFrame(): {
+    dx: number
+    dy: number
+    space: boolean
+    esc: boolean
+    m: boolean
+    q: boolean
+    atk: boolean
+    e: boolean
+  } {
     const out = {
       dx: this.mouseDX,
       dy: this.mouseDY,
@@ -88,6 +109,8 @@ export class Input {
       esc: this.escPressed,
       m: this.mPressed,
       q: this.qPressed,
+      atk: this.attackPressed,
+      e: this.ePressed,
     }
     this.mouseDX = 0
     this.mouseDY = 0
@@ -95,6 +118,8 @@ export class Input {
     this.escPressed = false
     this.mPressed = false
     this.qPressed = false
+    this.attackPressed = false
+    this.ePressed = false
     return out
   }
 }

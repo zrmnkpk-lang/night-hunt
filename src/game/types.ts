@@ -1,4 +1,8 @@
 // 共享类型定义
+
+// 玩家扮演的角色:求生者(4 人队伍之一)或杀手(1v4)
+export type PlayerRole = 'survivor' | 'hunter'
+
 export type SurvivorStatus =
   | 'healthy' // 健康
   | 'injured' // 受伤

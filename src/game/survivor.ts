@@ -10,7 +10,9 @@ import type { Cipher, Gate } from './world'
 
 type AiMode = 'decode' | 'flee' | 'rescue' | 'heal' | 'escape' | 'openGate' | 'idle'
 
-const AI_NAMES = ['阿岚', '老周', '小七']
+// 4 个名字:玩家扮演杀手时 4 名求生者全是 AI,索引需覆盖 id 0..3
+// (原为 3 个 + `AI_NAMES[(id-1)%3]`,id=0 时会取到 AI_NAMES[-1] = undefined)
+const AI_NAMES = ['阿岚', '老周', '小七', '阿澈']
 
 export class Survivor {
   id: number
@@ -59,6 +61,11 @@ export class Survivor {
   dashDur = 0.22
   private outlineOn = false
   private thinkT = 0
+  private decodeNoiseT = 8 // 破译噪音计时:staticDecodeNoise 开启时每 8s 暴露一次位置
+  // 单台密码机破译所需秒数(玩家扮演杀手时由 Engine 调慢,给杀手足够的狩猎窗口)
+  static staticDecodeTime = 70
+  // 破译时是否周期性产生噪音(玩家扮演杀手时开启,作为杀手的情报来源)
+  static staticDecodeNoise = false
 
   constructor(id: number, isPlayer: boolean, x: number, z: number, color: number, name?: string) {
     this.id = id
@@ -249,6 +256,8 @@ export class Survivor {
       this.mesh.armR.rotation.x = -1.35 * bend
       this.mesh.legL.rotation.x = 0.5 * bend
       this.mesh.legR.rotation.x = 0.5 * bend
+      // 放板转身:身体从左往右甩(发力感),结束时由 syncMesh 衰减归零
+      this.mesh.body.rotation.y = (t - 0.5) * 1.2
       return
     }
     if (this.status === 'downed') {
@@ -395,9 +404,17 @@ export class Survivor {
           this.path = []
           this.decoding = true
           this.speedNow = 0
-          const rate = dt / 70
+          const rate = dt / Survivor.staticDecodeTime
           c.progress = clamp(c.progress + rate, 0, 1)
           this.decodeTotal += rate
+          // 杀手局:破译周期性产生噪音,供杀手在小地图上定位(否则只能盲逛)
+          if (Survivor.staticDecodeNoise) {
+            this.decodeNoiseT -= dt
+            if (this.decodeNoiseT <= 0) {
+              this.decodeNoiseT = 8
+              ctx.addNoise(this.x, this.z)
+            }
+          }
           if (c.progress >= 1 && !c.done) {
             c.done = true
             ctx.onCipherDone(c)
@@ -671,12 +688,11 @@ export class Survivor {
       this.outlineOn = wantOutline
       for (const o of this.mesh.outline) o.visible = wantOutline
     }
-    animateHumanoid(this.mesh, dt, this.speedNow, this.pose(), time)
-    // 受伤姿态:略微弯腰
-    if (this.status === 'injured') {
-      this.mesh.body.rotation.x = 0.18
-    } else {
-      this.mesh.body.rotation.x = 0
+    animateHumanoid(this.mesh, dt, this.speedNow, this.pose(), time, this.status === 'injured')
+    // 非放板状态:身体 yaw 转身残留快速归零(放板转身动作结束后回正)
+    if (this.dropT <= 0) {
+      const by = this.mesh.body.rotation.y
+      this.mesh.body.rotation.y = by * Math.max(0, 1 - dt * 9)
     }
   }
 }

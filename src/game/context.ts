@@ -36,5 +36,9 @@ export const SPEED = {
   hunterInvestigate: 4.6,
   hunterChase: 6.05,
   hunterCarry: 3.9,
+  // 玩家扮演杀手时的追击基准:必须 > survAiSprint(6.15),否则平地永远追不上 AI 冲刺
+  hunterPlayerChase: 6.45,
+  // 玩家扛人移速(略高于 AI 的 3.9,给手动走位一点补偿)
+  hunterPlayerCarry: 4.1,
 }
 
