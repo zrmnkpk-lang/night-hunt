@@ -3,7 +3,7 @@ import * as THREE from 'three'
 import { World } from './world'
 import type { Cipher, Chair, Gate } from './world'
 import { Survivor } from './survivor'
-import { Hunter } from './hunter'
+import { Hunter, HIT_RECOVER } from './hunter'
 import { Qte } from './qte'
 import { Input } from './input'
 import { AudioEngine } from './audio'
@@ -729,7 +729,7 @@ export class Engine implements GameCtx {
     let mul = 1
     if (h.busy() || h.vaultT > 0) mul = 0 // 眩晕/破板/扛起/挂椅/瞬移/翻窗 → 定身
     else if (h.state === 'attack') mul = 0.5 // 前摇:半速逼近
-    else if (h.state === 'recover') mul = 0.6 // 后摇:60% 速
+    else if (h.state === 'recover') mul = h.hitRecovery ? 0 : 0.6 // 命中硬直定身;普通后摇 60% 速
 
     const ax = this.input.axis()
     const len = Math.hypot(ax.x, ax.z)
@@ -783,6 +783,7 @@ export class Engine implements GameCtx {
       )
       return
     }
+    if (h.state === 'recover' && h.hitRecovery) return set('攻击恢复中…', 1 - h.recoverT / HIT_RECOVER)
     if (h.state === 'breakpallet') return set('破坏木板中…', 1 - h.breakT / 2.0)
     if (h.state === 'pickup') return set('扛起中…', 1 - h.pickupT / 1.3)
     if (h.state === 'chair') return set('绑上狂欢之椅…', 1 - h.chairT / 2.0)

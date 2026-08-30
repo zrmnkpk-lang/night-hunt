@@ -11,6 +11,7 @@ import type { Survivor } from './survivor'
 
 const ATTACK_RANGE = 2.86 // 攻击触发距离(+30% 原 2.2),命中判定自动跟随
 const ATTACK_WINDUP = 0.22 // 攻击前摇(大幅加快,期间可半速移动)
+export const HIT_RECOVER = 2.0 // 命中后的硬直:原地停留约 2 秒,期间显示"攻击恢复中"且禁止行动(导出供 HUD 复用)
 const SIGHT_RANGE = 19
 const HEAR_RANGE = 30
 
@@ -125,6 +126,7 @@ export class Hunter {
   vaultDur = 1.7
   spottedToastDone = false
   recoverT = 0
+  hitRecovery = false // 命中后硬直标记:true 期间原地停留且禁止一切主动操作(由 resolveAttack 在命中时置位)
   // 瞬移技能(全图,1s 蓄力 + 瞬移 + 1s 后摇,60s 冷却)。AI 自动判断追击时使用。
   teleportCd = 0
   teleportPhase: 'none' | 'windup' | 'after' = 'none'
@@ -307,18 +309,20 @@ export class Hunter {
           this.resolveAttack(ctx)
           // resolveAttack 可能已切换到 pickup(击倒目标)
           if (this.state === 'attack') {
-            // 命中或落空:进入短暂恢复(后摇)
+            // 命中(硬直 2s)或落空(短后摇 0.45s):进入恢复
             this.state = 'recover'
-            this.recoverT = 0.45
+            this.recoverT = this.hitRecovery ? HIT_RECOVER : 0.45
           }
         }
         break
       }
       case 'recover': {
         this.recoverT -= dt
-        // 命中/落空后的恢复期不再定身:垂刀动画照播,AI 以 60% 速继续逼近(消除停滞感)。
-        // 玩家扮演时移动由 Engine 驱动(60% 速)。
-        if (!this.isPlayerControlled) {
+        if (this.hitRecovery) {
+          // 命中硬直:原地停留,不移动(给求生者喘息/反击窗口)
+          this.speedNow = 0
+        } else if (!this.isPlayerControlled) {
+          // 落空后摇:AI 以 60% 速继续逼近(消除停滞感)
           const rs = this.target >= 0 ? ctx.survivors[this.target] : null
           if (rs && rs.alive && !rs.incapacitated) {
             const sp = SPEED.hunterChase * this.speedMul * 0.6
@@ -333,6 +337,7 @@ export class Hunter {
           }
         }
         if (this.recoverT <= 0) {
+          this.hitRecovery = false
           const s = this.target >= 0 ? ctx.survivors[this.target] : null
           this.state = s && s.alive && !s.incapacitated && !this.isPlayerControlled ? 'chase' : 'patrol'
           this.path = []
@@ -540,9 +545,13 @@ export class Hunter {
         break
       }
       case 'recover': {
-        // 后摇计时(移动由 Engine,60% 速);垂刀动画由 syncMesh 播放,speedNow 保持 Engine 设置值
+        // 后摇/命中硬直计时(移动由 Engine 驱动);命中硬直时 Engine 会定身(mul=0)
         this.recoverT -= dt
-        if (this.recoverT <= 0) this.state = 'patrol'
+        this.speedNow = 0
+        if (this.recoverT <= 0) {
+          this.hitRecovery = false
+          this.state = 'patrol'
+        }
         break
       }
       case 'pickup': {
@@ -640,7 +649,7 @@ export class Hunter {
             this.resolveAttack(ctx)
             if (this.state === 'attack') {
               this.state = 'recover'
-              this.recoverT = 0.45
+              this.recoverT = this.hitRecovery ? HIT_RECOVER : 0.45
             }
           }
         }
@@ -820,9 +829,9 @@ export class Hunter {
     return this.chaseSpeedBuff * this.ai.CHASE_BUFF_STEP
   }
 
-  // 玩家可自由行动(不受状态机定身、未扛人、不在翻窗中)
+  // 玩家可自由行动(不受状态机定身、未扛人、不在翻窗中、不在命中硬直中)
   canAct(): boolean {
-    return !this.busy() && !this.carrying() && this.vaultT <= 0
+    return !this.busy() && !this.carrying() && this.vaultT <= 0 && !this.hitRecovery
   }
 
   private patrol(ctx: GameCtx, dt: number): void {
@@ -1106,12 +1115,14 @@ export class Hunter {
 
   private resolveAttack(ctx: GameCtx): void {
     this.attackCd = 0.45 // 与后摇时长一致(后摇结束即可再次攻击)
+    this.hitRecovery = false // 每轮攻击重新判定:仅命中才进入硬直
     const s = ctx.survivors[this.target]
     if (!s) return
     const d = dist(this.x, this.z, s.x, s.z)
     if (d < ATTACK_RANGE + 0.5 && s.alive && !s.incapacitated) {
       s.hurt(ctx)
       this.sectorFlashT = 0.4 // 命中红光爆闪
+      this.hitRecovery = true // 命中:触发约 2 秒原地硬直
       if (s.status === 'downed') {
         if (this.isPlayerControlled) {
           // 玩家局:只提示,不自动扛起 —— 玩家可以继续追别人,或稍后回来扛(放血战术)
