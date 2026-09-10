@@ -1,5 +1,6 @@
 // 程序化低多边形人形角色(幸存者/猎人)
 import * as THREE from 'three'
+import { artPart } from './art-details'
 
 // 透视轮廓共享材质(红色警示,穿墙可见)
 // 模块级单例:被所有人形共用,disposeScene 必须跳过它(释放后重开局透视会失效)
@@ -39,14 +40,15 @@ export interface Humanoid {
 function makeLantern(): { g: THREE.Group; core: THREE.MeshStandardMaterial; light: THREE.PointLight } {
   const g = new THREE.Group()
   const frameMat = new THREE.MeshStandardMaterial({ color: 0x1c1a16, roughness: 0.6, metalness: 0.7 })
+  g.name = 'hand-lantern'
   // 上下盖
   const top = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.11, 0.04, 8), frameMat)
   top.position.y = 0.14
   const bottom = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.09, 0.04, 8), frameMat)
   bottom.position.y = -0.12
   // 立柱
-  for (let i = 0; i < 3; i++) {
-    const a = (i / 3) * Math.PI * 2
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2
     const post = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.24, 4), frameMat)
     post.position.set(Math.cos(a) * 0.09, 0.01, Math.sin(a) * 0.09)
     g.add(post)
@@ -61,7 +63,20 @@ function makeLantern(): { g: THREE.Group; core: THREE.MeshStandardMaterial; ligh
     emissiveIntensity: 2.4,
   })
   const coreMesh = new THREE.Mesh(new THREE.SphereGeometry(0.055, 8, 8), core)
+  top.name = 'vented-cap'
+  bottom.name = 'oil-reservoir'
+  handle.name = 'carry-handle'
+  coreMesh.name = 'flame'
+  coreMesh.scale.set(0.65, 1.65, 0.65)
   g.add(top, bottom, handle, coreMesh)
+  const brass = new THREE.MeshStandardMaterial({ color: 0x9b7844, roughness: 0.5, metalness: 0.65 })
+  artPart(g, 'burner', new THREE.CylinderGeometry(0.037, 0.049, 0.035, 8), brass, 0, -0.065, 0)
+  artPart(g, 'chimney', new THREE.CylinderGeometry(0.04, 0.065, 0.045, 8), frameMat, 0, 0.177, 0)
+  artPart(g, 'wick-knob', new THREE.CylinderGeometry(0.022, 0.022, 0.028, 6), brass, 0.088, -0.09, 0)
+  for (let i = 0; i < 2; i++) {
+    const rim = artPart(g, `glass-rim-${i}`, new THREE.TorusGeometry(0.091, 0.008, 4, 8), brass, 0, i === 0 ? -0.09 : 0.115, 0)
+    rim.rotation.x = Math.PI / 2
+  }
   const light = new THREE.PointLight(0xffb35c, 2.4, 12.5, 1.4)
   light.position.y = 0.05
   g.add(light)

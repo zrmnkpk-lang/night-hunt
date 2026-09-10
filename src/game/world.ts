@@ -1,6 +1,7 @@
 // 地图构建:围墙、板区、窗户、密码机、狂欢之椅、电闸门、枯树、雾与灯光
 import * as THREE from 'three'
 import { NavGrid } from './navgrid'
+import { addChairDetails, makeCourtyardGround, makePalletDebris } from './art-details'
 import type { AABB } from './types'
 
 export interface Pallet {
@@ -11,6 +12,7 @@ export interface Pallet {
   state: 'up' | 'down' | 'broken'
   mesh: THREE.Group
   pivot: THREE.Group // 倒下旋转容器(内容以板中心为原点,侧倒 = pivot.rotation.x 0→-π/2)
+  debris: THREE.Group // 破坏后保留的非碰撞碎木
   fallT: number // 倒下过渡动画剩余时间(>0 表示动画中)
   fallDur: number
   sx: number // 站立点 x(门洞侧边、宽面贴墙处)
@@ -290,7 +292,11 @@ export class World {
       axis === 'x'
         ? { minX: x - 1.1, maxX: x + 1.1, minZ: z - 0.575, maxZ: z + 0.575 }
         : { minX: x - 0.575, maxX: x + 0.575, minZ: z - 1.1, maxZ: z + 1.1 }
-    this.pallets.push({ id: this.pallets.length, x, z, axis, state: 'up', mesh: g, pivot, fallT: 0, fallDur: 0.45, sx, sz, colUp, collider })
+    const debris = makePalletDebris()
+    debris.position.set(x, 0, z)
+    debris.rotation.y = g.rotation.y
+    this.scene.add(debris)
+    this.pallets.push({ id: this.pallets.length, x, z, axis, state: 'up', mesh: g, pivot, debris, fallT: 0, fallDur: 0.45, sx, sz, colUp, collider })
   }
 
   private cipher(x: number, z: number): void {
@@ -413,8 +419,10 @@ export class World {
     g.position.set(x, 0, z)
     this.scene.add(g)
     this.cullableLights.push({ light, x, z })
+    addChairDetails(g, this.metalMat)
     // 透视高亮覆盖层(克隆共享几何,剔除光源)
     const hl = g.clone(true)
+    hl.position.set(0, 0, 0) // 覆盖层是 g 的子节点，不能重复应用世界坐标
     const toRemove: THREE.Object3D[] = []
     hl.traverse((o) => {
       if (o instanceof THREE.PointLight) toRemove.push(o)
@@ -661,13 +669,7 @@ export class World {
 
   private build(): void {
     const B = 34.5 // 围墙位置
-    // 地面
-    const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(90, 90),
-      new THREE.MeshStandardMaterial({ color: 0x1d2027, roughness: 1 }),
-    )
-    ground.rotation.x = -Math.PI / 2
-    this.scene.add(ground)
+    this.scene.add(makeCourtyardGround())
 
     // 周边墙(留出电闸门缺口)
     this.wall(-B - 1, -B, -14, -B)

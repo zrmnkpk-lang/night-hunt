@@ -277,6 +277,7 @@ export class Hunter {
           if (p && p.state === 'down') {
             p.state = 'broken'
             p.mesh.visible = false
+            p.debris.visible = true
             ctx.nav.setDynamicAABB(p.collider, false)
             // 移除碰撞
             const cols = ctx.world.colliders
@@ -533,6 +534,7 @@ export class Hunter {
           if (p && p.state === 'down') {
             p.state = 'broken'
             p.mesh.visible = false
+            p.debris.visible = true
             ctx.nav.setDynamicAABB(p.collider, false)
             const cols = ctx.world.colliders
             for (let i = cols.length - 1; i >= 0; i--) {
