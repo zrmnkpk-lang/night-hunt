@@ -1,73 +1,45 @@
-# React + TypeScript + Vite
+# 夜猎庄园
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+基于 React、TypeScript、Vite 和 Three.js 开发的网页非对称对抗游戏原型。
 
-Currently, two official plugins are available:
+当前支持求生者与杀手两种可玩角色，游戏内场景、角色和交互物主要采用程序化低多边形模型生成；仓库同时维护一套用于后续美术建模的参考图资产。
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## 当前状态
 
-## React Compiler
+- 求生者和杀手均可选择并进入游戏
+- 杀手支持攻击、瞬移、扛起、破板和翻窗
+- 求生者支持破译、治疗、救援、逃脱和冲刺
+- 包含密码机、狂欢之椅、电闸门、木板、路灯、树木、草丛等场景交互
+- 参考图资产已整理至 `docs/art-reference/`
+- 当前参考图共 19 张，已使用完整 WebP 文件同步
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## 项目文档
 
-## Expanding the ESLint configuration
+- [美术资产清单](docs/art-assets-inventory.md)：当前运行时资源、程序化资产和美术资源缺口
+- [美术参考图索引](docs/art-reference-index.md)：19 张参考图及其对应资产
+- [项目更新日志](docs/update-log.md)：代码、资源和文档的主要更新记录
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## 本地运行
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+构建生产版本：
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run build
 ```
+
+## 目录说明
+
+- `src/game/`：游戏引擎、角色、场景、输入、音频和运行时逻辑
+- `src/components/`：HUD 与界面组件
+- `src/assets/`：运行时图片资源
+- `docs/art-reference/`：美术参考图，不参与运行时加载
+- `docs/`：资产说明、参考图索引和项目更新日志
+
+## 资源状态说明
+
+当前仓库仍以程序化模型为主，尚未包含正式的 `.glb`、`.gltf`、`.fbx`、`.obj` 模型文件，也没有独立的预制音频包和完整 UI 图标包。后续美术制作应优先参考 `docs/art-reference/` 中的角色、环境和交互物方向。
