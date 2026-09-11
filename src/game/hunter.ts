@@ -8,6 +8,7 @@ import { losBlocked, circleHits, segmentHitsAABB } from './navgrid'
 import { SPEED } from './context'
 import type { GameCtx } from './context'
 import type { Survivor } from './survivor'
+import { teleportGeometry } from './art'
 
 const ATTACK_RANGE = 2.86 // 攻击触发距离(+30% 原 2.2),命中判定自动跟随
 const ATTACK_WINDUP = 0.22 // 攻击前摇(大幅加快,期间可半速移动)
@@ -191,7 +192,8 @@ export class Hunter {
       depthWrite: false,
       side: THREE.DoubleSide,
     })
-    this.teleportPillar = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.9, 3.0, 16, 1, true), this.teleportPillarMat)
+    this.teleportPillar = new THREE.Mesh(teleportGeometry(), this.teleportPillarMat)
+    this.teleportPillar.name = 'Teleport_ribbons'
     this.teleportPillar.position.y = 1.5
     this.teleportPillar.renderOrder = 3
     this.teleportPillar.visible = false
@@ -205,7 +207,10 @@ export class Hunter {
       depthWrite: false,
       side: THREE.DoubleSide,
     })
-    this.teleportRing = new THREE.Mesh(new THREE.RingGeometry(0.4, 0.7, 24), this.teleportRingMat)
+    this.teleportRing = new THREE.Mesh(new THREE.RingGeometry(0.58, 0.7, 32), this.teleportRingMat)
+    this.teleportRing.name = 'Teleport_echo'
+    const echo = new THREE.Mesh(new THREE.RingGeometry(0.36, 0.39, 32), this.teleportRingMat)
+    this.teleportRing.add(echo)
     this.teleportRing.rotation.x = -Math.PI / 2
     this.teleportRing.position.y = 0.05
     this.teleportRing.renderOrder = 3

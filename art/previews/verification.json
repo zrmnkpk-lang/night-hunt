@@ -1,0 +1,21 @@
+{
+  "baselineRef": "f1e37081ad585c0c947b1a66fc789e546b159586",
+  "checks": [
+    "collision parity with pre-art revision",
+    "sight blocker parity",
+    "all 5 pallet fall/break states",
+    "both gate pivots and status handles",
+    "chair highlight alignment",
+    "pose reset and hand-held weapon",
+    "cipher active/completed state"
+  ],
+  "before": {
+    "meshes": 1311,
+    "triangles": 18226
+  },
+  "after": {
+    "meshes": 672,
+    "triangles": 113042
+  },
+  "exportedAssets": 18
+}

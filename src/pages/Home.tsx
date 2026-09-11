@@ -20,11 +20,19 @@ export default function Home() {
     input.attach(canvas)
     const engine = new Engine(canvas, input, audio)
     engineRef.current = engine
+    if (import.meta.env.DEV) {
+      window.render_game_to_text = () => engine.renderGameToText()
+      window.advanceTime = ms => engine.advanceTime(ms)
+    }
     setHud({ phase: 'menu' })
     return () => {
       engine.dispose()
       input.detach()
       engineRef.current = null
+      if (import.meta.env.DEV) {
+        delete window.render_game_to_text
+        delete window.advanceTime
+      }
     }
   }, [])
 

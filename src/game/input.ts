@@ -12,6 +12,10 @@ export class Input {
   ePressed = false // E 键边沿(杀手需要:扛起/破坏/放下);求生者继续用持续态 eHeld
   private canvas: HTMLCanvasElement | null = null
   enabled = false
+  // 指针锁定不可用标志:嵌入式 webview 中 requestPointerLock 会被直接拒绝
+  // ("root document is not valid for pointer lock")。此时降级为无锁定视角,
+  // 只要鼠标在画布上移动就照常累积 movementX/Y,保证镜头始终可转。
+  private lockUnavailable = false
 
   private onKeyDown = (e: KeyboardEvent): void => {
     if (!this.enabled) return
@@ -40,7 +44,8 @@ export class Input {
 
   private onMouseMove = (e: MouseEvent): void => {
     if (!this.enabled) return
-    if (document.pointerLockElement === this.canvas) {
+    // 正常路径:已锁定;降级路径:锁定不可用时仅响应画布上的移动(悬停 HUD 按钮不转镜头)
+    if (document.pointerLockElement === this.canvas || (this.lockUnavailable && e.target === this.canvas)) {
       this.mouseDX += e.movementX
       this.mouseDY += e.movementY
     }
@@ -48,7 +53,11 @@ export class Input {
 
   private onMouseDown = (e: MouseEvent): void => {
     if (!this.enabled) return
-    if (e.button === 0) this.attackPressed = true // 左键:杀手攻击
+    if (e.button === 0) {
+      this.attackPressed = true // 左键:杀手攻击
+      // 降级模式下借每次画布点击重新尝试真锁定(浏览器要求用户手势),成功即自动回到锁定模式
+      if (this.lockUnavailable && e.target === this.canvas) this.requestLock()
+    }
   }
 
   attach(canvas: HTMLCanvasElement): void {
@@ -67,13 +76,24 @@ export class Input {
   }
 
   requestLock(): void {
-    if (this.canvas && document.pointerLockElement !== this.canvas) {
-      this.canvas.requestPointerLock()
+    if (!this.canvas || document.pointerLockElement === this.canvas) return
+    try {
+      // 新版 Chrome 返回 Promise:失败(如 Esc 后冷却期被拒)走 rejection;
+      // 部分嵌入式 webview 不支持 pointer lock:同步抛 WrongDocumentError。
+      // 两条失败路径都降级,绝不能让异常打断 start()/resume() 的后续流程。
+      const req = this.canvas.requestPointerLock() as unknown as Promise<void> | undefined
+      if (req && typeof req.catch === 'function') req.catch(() => (this.lockUnavailable = true))
+    } catch {
+      this.lockUnavailable = true
     }
   }
 
   exitLock(): void {
-    if (document.pointerLockElement) document.exitPointerLock()
+    try {
+      if (document.pointerLockElement) document.exitPointerLock()
+    } catch {
+      // 忽略:个别环境不支持
+    }
   }
 
   get locked(): boolean {

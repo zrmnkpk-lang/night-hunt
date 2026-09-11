@@ -56,6 +56,7 @@ export class Engine implements GameCtx {
   private lastT = 0
   private running = false
   private loopId = 0
+  private manualStepping = false
   private paused = false
   private over = false
 
@@ -86,6 +87,8 @@ export class Engine implements GameCtx {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping
     this.renderer.toneMappingExposure = 1.9
+    this.renderer.shadowMap.enabled = true
+    this.renderer.shadowMap.type = THREE.PCFShadowMap
     this.camera = new THREE.PerspectiveCamera(68, 1, 0.1, 120)
     this.buildScene()
     this.resize()
@@ -170,6 +173,11 @@ export class Engine implements GameCtx {
       this.scene.add(s.mesh.group)
     }
     Survivor.staticColliders = this.world.colliders
+    for (const character of [this.hunter.mesh, ...this.survivors.map(s => s.mesh)]) {
+      character.group.traverse(o => {
+        if (o instanceof THREE.Mesh && !Array.isArray(o.material) && !o.material.transparent) o.castShadow = true
+      })
+    }
     // 杀手局:放缓 AI 破译(70s → 95s/台),并让破译产生噪音作为杀手的情报来源。
     // 否则 4 人并行约 110s 就能全员逃脱,杀手根本没有 3 杀的窗口。
     Survivor.staticDecodeTime = isHunter ? 95 : 70
@@ -226,6 +234,7 @@ export class Engine implements GameCtx {
   // ---- 生命周期 ----
   // role 缺省时沿用上一局的选择(结算页"再来一局"不传参)
   start(role?: PlayerRole): void {
+    this.manualStepping = false
     if (role) this.playerRole = role
     // 丢弃菜单期累积的输入:点"开始游戏"的 mousedown 会被记为攻击,开局瞬间白挥一刀
     this.input.endFrame()
@@ -257,7 +266,7 @@ export class Engine implements GameCtx {
       this.raf = requestAnimationFrame(loop)
       const dt = Math.min(0.05, (t - this.lastT) / 1000)
       this.lastT = t
-      if (!this.paused) this.tick(dt)
+      if (!this.paused && !this.manualStepping) this.tick(dt)
     }
     this.raf = requestAnimationFrame(loop)
   }
@@ -269,6 +278,27 @@ export class Engine implements GameCtx {
     this.input.exitLock()
     this.audio.setChase(false)
     this.audio.setHum(false)
+  }
+
+  /** Development-only browser harness; production UI never attaches these methods. */
+  renderGameToText(): string {
+    return JSON.stringify({
+      coordinates: 'metres; +Y up, X/Z ground; character front +Z',
+      phase: getHud().phase, role: this.playerRole, time: Math.round(this.time * 100) / 100,
+      hunter: { x: this.hunter.x, z: this.hunter.z, state: this.hunter.state },
+      survivors: this.survivors.map(s => ({ id: s.id, x: s.x, z: s.z, status: s.status })),
+      pallets: this.world.pallets.map(p => ({ id: p.id, state: p.state, debris: p.debris.visible })),
+      gates: this.world.gates.map(g => ({ id: g.id, opened: g.opened, progress: g.openProgress })),
+      ciphers: this.world.ciphers.map(c => ({ id: c.id, progress: c.progress, done: c.done })),
+      render: { calls: this.renderer.info.render.calls, triangles: this.renderer.info.render.triangles },
+    })
+  }
+
+  advanceTime(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0 || !this.running || this.paused || this.over) return
+    this.manualStepping = true
+    const seconds = Math.min(ms / 1000, 10), steps = Math.max(1, Math.ceil(seconds * 60))
+    for (let i = 0; i < steps && !this.over; i++) this.tick(seconds / steps)
   }
 
   // 回到主菜单(结算页"返回菜单"):停掉本局并释放指针锁定,以便重新选择角色。
@@ -710,10 +740,6 @@ export class Engine implements GameCtx {
     this.camYaw -= f.dx * 0.0024 * sens
     this.camPitch = clamp(this.camPitch - f.dy * 0.0022 * sens, -1.15, 0.5)
 
-    // 2) 朝向恒等于视角朝向:保证"攻击方向 = 视角方向",扛人跟随也以 yaw 为准。
-    //    移动时【不再】覆盖 yaw,否则攻击朝向会跟着移动方向偏。
-    h.yaw = this.camYaw
-
     // 3) 边沿输入:扛人时 E 语义变为"放下(放血)",其余动作整体禁用
     if (h.carrying()) {
       if (f.e) h.playerDropCarried(this)
@@ -736,14 +762,20 @@ export class Engine implements GameCtx {
     if (len > 0 && mul > 0) {
       const sin = Math.sin(this.camYaw)
       const cos = Math.cos(this.camYaw)
-      // 屏幕右 = (-cos, sin);前方 = (sin, cos)
+      // 屏幕右 = (-cos, sin);前方 = (sin, cos)。两轴都要除 len 归一化,
+      // 否则斜向移动会偏向正前方且速度偏快约 20%(与求生者移动保持同一算式)。
       const wx = (-ax.x * cos - ax.z * sin) / len
-      const wz = ax.x * sin - ax.z * cos
+      const wz = (ax.x * sin - ax.z * cos) / len
       const sp = h.carrying() ? SPEED.hunterPlayerCarry : h.playerMoveSpeed() * mul
       h.moveWithCollision(this, wx * sp * dt, wz * sp * dt)
       h.speedNow = sp
+      // 自由移动时朝移动方向(与求生者手感一致,攻击命中为径向判定不受朝向影响)
+      h.yaw = Math.atan2(wx, wz)
     } else {
       h.speedNow = 0
+      // 静止或动作状态(攻击/瞬移/破板/扛人/翻越)定身时:朝向回正到视角方向,
+      // 保证挥刀动作与警示扇形正对瞄准方向,被扛者也拖在身后。
+      h.yaw = this.camYaw
     }
 
     // 5) 底部交互提示

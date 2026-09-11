@@ -2,6 +2,7 @@
 import * as THREE from 'three'
 import { NavGrid } from './navgrid'
 import type { AABB } from './types'
+import { bevelBox, box as artBox, beam, material, batchRigid, contactShadow, dressPallet, dressCipher, dressChair, dressDoor, makeGround, makeDistantManor, makePalletDebris } from './art'
 
 export interface Pallet {
   id: number
@@ -17,6 +18,7 @@ export interface Pallet {
   sz: number // 站立点 z
   colUp: AABB // 竖板:与薄板视觉一致的细长 AABB
   collider: AABB // 倒板:低矮平放的长条 AABB(放倒时生效)
+  debris: THREE.Group
 }
 
 export interface WindowVault {
@@ -83,9 +85,10 @@ export class World {
   // 可裁剪的点光源(密码机/椅子/路灯),距玩家较远时关闭以避免超 GPU 光源上限导致闪烁
   cullableLights: { light: THREE.PointLight; x: number; z: number }[] = []
 
-  private wallMat = new THREE.MeshStandardMaterial({ color: 0x383c45, roughness: 0.95 })
+  private wallMat = material('Stone_sage', 0x555f57)
+  private stoneMats = [this.wallMat, material('Stone_lichen', 0x62695b), material('Stone_shade', 0x444e4b), material('Stone_warm', 0x62645a)]
   private lowWallMat = new THREE.MeshStandardMaterial({ color: 0x40444d, roughness: 0.9 })
-  private woodMat = new THREE.MeshStandardMaterial({ color: 0x5a4936, roughness: 0.9 })
+  private woodMat = material('Weathered_oak', 0x756045)
   private metalMat = new THREE.MeshStandardMaterial({ color: 0x484e57, roughness: 0.6, metalness: 0.6 })
 
   constructor(scene: THREE.Scene) {
@@ -95,12 +98,12 @@ export class World {
   }
 
   // 砖块几何缓存(同尺寸复用,避免重复创建)
-  private brickGeoCache = new Map<string, THREE.BoxGeometry>()
-  private brickGeo(w: number, h: number, d: number): THREE.BoxGeometry {
+  private brickGeoCache = new Map<string, THREE.BufferGeometry>()
+  private brickGeo(w: number, h: number, d: number): THREE.BufferGeometry {
     const key = `${w.toFixed(2)}_${h.toFixed(2)}_${d.toFixed(2)}`
     let g = this.brickGeoCache.get(key)
     if (!g) {
-      g = new THREE.BoxGeometry(w, h, d)
+      g = bevelBox(w, h, d, 0.055)
       this.brickGeoCache.set(key, g)
     }
     return g
@@ -129,6 +132,7 @@ export class World {
     const long = Math.max(w, d)
     const style = visual === 'auto' ? (h <= LOW_H + 0.01 ? 'planks' : long > 25 ? 'plain' : 'bricks') : visual
     const g = new THREE.Group()
+    g.name = h <= LOW_H + 0.01 ? 'Vault_low_wall' : 'Modular_stone_wall'
     if (style === 'bricks') {
       // 参考图墙体:两端木柱 + 砖块阵列(缝隙靠块间留白)
       const alongX = w >= d // 墙的走向
@@ -154,7 +158,7 @@ export class World {
         for (let c = 0; c < n; c++) {
           const bx = start + c * step
           const geo = this.brickGeo(alongX ? bw : thick, rowH - 0.05, alongX ? thick : bw)
-          const brick = new THREE.Mesh(geo, this.wallMat)
+          const brick = new THREE.Mesh(geo, this.stoneMats[(c * 7 + r * 3 + Math.abs(Math.round(cx + cz))) % 4])
           brick.position.set(
             alongX ? cx + bx : cx,
             (r + 0.5) * rowH,
@@ -166,10 +170,13 @@ export class World {
     } else if (style === 'planks') {
       // 参考图窗户:矮墙缺口上斜钉两根木板
       const alongX = w >= d
-      const baseGeo = this.brickGeo(w, h, d)
-      const base = new THREE.Mesh(baseGeo, this.lowWallMat)
-      base.position.set(cx, h / 2, cz)
-      g.add(base)
+      // Three irregular stone columns with an oak sill, matching the low barrier reference.
+      for (let i = 0; i < 3; i++) for (let row = 0; row < 2; row++) {
+        const length = Math.max(w, d) / 3 - 0.025
+        const along = (i - 1) * Math.max(w, d) / 3
+        artBox(g, 'Low_barrier_stone', [alongX ? length : w, h * 0.42, alongX ? d : length], [cx + (alongX ? along : 0), 0.13 + h * 0.21 + row * h * 0.43, cz + (alongX ? 0 : along)], this.stoneMats[(i + row) % 4], 0.055)
+      }
+      artBox(g, 'Oak_sill', [w, 0.14, d], [cx, 0.07, cz], this.woodMat)
       const plankLen = Math.max(w, d) * 0.78
       const plankGeo = this.brickGeo(alongX ? plankLen : 0.12, 0.1, alongX ? 0.12 : plankLen)
       for (const s of [-1, 1]) {
@@ -186,6 +193,18 @@ export class World {
       mesh.position.set(cx, h / 2, cz)
       g.add(mesh)
     }
+    // Stone coping and lower moss band stay inside the existing wall footprint.
+    artBox(g, 'Coping', [w, 0.11, d], [cx, h - 0.055, cz], this.stoneMats[1], 0.025)
+    if (h > LOW_H) {
+      artBox(g, 'Moss_footing', [w, 0.13, d], [cx, 0.07, cz], this.stoneMats[2], 0.02)
+      const alongX = w >= d
+      for (const s of [-1, 1]) {
+        const px = alongX ? cx + s * (w / 2 - 0.15) : cx
+        const pz = alongX ? cz : cz + s * (d / 2 - 0.15)
+        artBox(g, 'Iron_post_band', [alongX ? 0.26 : w + 0.025, 0.105, alongX ? d + 0.025 : 0.26], [px, h * 0.72, pz], this.metalMat)
+      }
+    }
+    batchRigid(g)
     this.scene.add(g)
     this.colliders.push(box)
     if (blocksSight) this.tallWalls.push(box)
@@ -250,14 +269,14 @@ export class World {
     const LEN = 2.45
     const H = 1.7
     // 两根竖柱(长轴两端,居中)
-    const postGeo = new THREE.BoxGeometry(0.18, H, 0.18)
+    const postGeo = bevelBox(0.18, H, 0.18)
     for (const px of [-LEN / 2 + 0.12, LEN / 2 - 0.12]) {
       const post = new THREE.Mesh(postGeo, this.woodMat)
       post.position.set(px, 0, 0)
       pivot.add(post)
     }
     // 4 根横板条 + 每板 2 颗铆钉(沿高度均布居中)
-    const plankGeo = new THREE.BoxGeometry(LEN, 0.2, 0.28)
+    const plankGeo = bevelBox(LEN, 0.2, 0.28)
     const rivetGeo = new THREE.BoxGeometry(0.07, 0.05, 0.05)
     for (let i = 0; i < 4; i++) {
       const py = -0.45 + i * 0.3
@@ -270,6 +289,8 @@ export class World {
         pivot.add(rivet)
       }
     }
+    dressPallet(pivot)
+    g.name = 'Pallet'
     g.add(pivot)
     if (axis === 'z') g.rotation.y = Math.PI / 2 // 长轴沿 z
     // 站立位:宽边贴靠着门洞短边(缺口两侧的墙端)的墙体侧面,留出门洞过道
@@ -290,7 +311,12 @@ export class World {
       axis === 'x'
         ? { minX: x - 1.1, maxX: x + 1.1, minZ: z - 0.575, maxZ: z + 0.575 }
         : { minX: x - 0.575, maxX: x + 0.575, minZ: z - 1.1, maxZ: z + 1.1 }
-    this.pallets.push({ id: this.pallets.length, x, z, axis, state: 'up', mesh: g, pivot, fallT: 0, fallDur: 0.45, sx, sz, colUp, collider })
+    const debris = makePalletDebris()
+    debris.position.set(x, 0, z)
+    debris.rotation.y = g.rotation.y
+    debris.visible = false
+    this.scene.add(debris)
+    this.pallets.push({ id: this.pallets.length, x, z, axis, state: 'up', mesh: g, pivot, fallT: 0, fallDur: 0.45, sx, sz, colUp, collider, debris })
   }
 
   private cipher(x: number, z: number): void {
@@ -298,7 +324,7 @@ export class World {
     // 参考图风格:深灰方盒 + 侧面黄色大转轮 + 正面红色发光圆柱灯 + 顶部双排气管 + 四条腿
     const bodyMat = new THREE.MeshStandardMaterial({ color: 0x3a3d43, roughness: 0.85 })
     const wheelMat = new THREE.MeshStandardMaterial({ color: 0xc9a635, roughness: 0.6, metalness: 0.3 })
-    const body = new THREE.Mesh(new THREE.BoxGeometry(1.3, 1.15, 1.0), bodyMat)
+    const body = new THREE.Mesh(bevelBox(1.3, 1.15, 1.0, 0.055), bodyMat)
     body.position.y = 0.95
     g.add(body)
     // 四条腿
@@ -358,6 +384,7 @@ export class World {
     this.cullableLights.push({ light, x, z })
     this.colliders.push({ minX: x - 0.55, maxX: x + 0.55, minZ: z - 0.4, maxZ: z + 0.4 })
     this.nav.markAABB({ minX: x - 0.55, maxX: x + 0.55, minZ: z - 0.4, maxZ: z + 0.4 }, 0.35)
+    dressCipher(g)
     this.ciphers.push({
       id: this.ciphers.length,
       x,
@@ -413,6 +440,7 @@ export class World {
     g.position.set(x, 0, z)
     this.scene.add(g)
     this.cullableLights.push({ light, x, z })
+    dressChair(g)
     // 透视高亮覆盖层(克隆共享几何,剔除光源)
     const hl = g.clone(true)
     const toRemove: THREE.Object3D[] = []
@@ -424,9 +452,11 @@ export class World {
       }
     })
     for (const l of toRemove) l.parent?.remove(l)
+    hl.position.set(0, 0, 0)
     hl.scale.set(1.07, 1.07, 1.07)
     hl.visible = false
     g.add(hl)
+    contactShadow(g, 0.75, 0.75)
     this.colliders.push({ minX: x - 0.5, maxX: x + 0.5, minZ: z - 0.5, maxZ: z + 0.5 })
     this.nav.markAABB({ minX: x - 0.5, maxX: x + 0.5, minZ: z - 0.5, maxZ: z + 0.5 }, 0.35)
     this.chairs.push({ id: this.chairs.length, x, z, occupiedBy: -1, mesh: g, highlight: hl })
@@ -470,6 +500,13 @@ export class World {
     const glow = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.46, 0.44), glowMat)
     glow.position.set(0.46, 4.12, 0)
     g.add(head, cap, glow)
+    g.name = 'Bent_street_lamp'
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+      artBox(g, 'Lantern_cage', [0.038, 0.49, 0.038], [0.46 + sx * 0.235, 4.12, sz * 0.235], postMat)
+    }
+    artBox(g, 'Lantern_lower_cap', [0.57, 0.09, 0.57], [0.46, 3.87, 0], postMat)
+    batchRigid(g)
+    contactShadow(g, 0.6, 0.6)
     const light = new THREE.PointLight(0xffd9a0, 3.6, 20, 1.2)
     light.position.set(0.46, 3.9, 0)
     g.add(light)
@@ -540,11 +577,14 @@ export class World {
       )
       handle.position.set(-side * 1.7, 2.25, 0.1)
       d.add(handle)
+      dressDoor(d, side, lampMat)
       return d
     }
     const doorL = buildDoor(-1)
     const doorR = buildDoor(1)
     g.add(doorL, doorR)
+    g.name = 'Exit_gate'
+    batchRigid(g)
     g.position.set(x, 0, z)
     this.cullableLights.push({ light, x, z })
     this.scene.add(g)
@@ -552,6 +592,9 @@ export class World {
     const panel = new THREE.Mesh(new THREE.BoxGeometry(0.7, 1.3, 0.4), this.metalMat)
     panel.position.set(switchX, 0.65, switchZ)
     this.scene.add(panel)
+    panel.name = 'Gate_switch'
+    artBox(panel, 'Switch_status', [0.38, 0.12, 0.04], [0, 0.3, 0.22], lampMat)
+    for (let i = 0; i < 3; i++) artBox(panel, 'Switch_vent', [0.35, 0.025, 0.025], [0, -0.2 + i * 0.09, 0.21], frameMat)
     const lever = new THREE.Mesh(
       new THREE.BoxGeometry(0.12, 0.5, 0.12),
       new THREE.MeshStandardMaterial({ color: 0xd41d1f, emissive: 0x550808, emissiveIntensity: 1 }),
@@ -618,6 +661,8 @@ export class World {
     }
     g.position.set(x, 0, z)
     g.rotation.y = Math.random() * Math.PI * 2 // 整丛朝向随机
+    g.name = 'Ghost_grass'
+    batchRigid(g)
     this.scene.add(g)
   }
 
@@ -653,6 +698,17 @@ export class World {
     canopy(0.12, 3.7, 1.1) // 顶冠
     canopy(-0.95, 2.9, 0.85) // 左冠
     canopy(0.95, 2.8, 0.8) // 右冠
+    g.name = 'Ghost_tree'
+    // Angular exposed roots and forked branch tips keep the reference's crooked silhouette.
+    for (let i = 0; i < 5; i++) {
+      const a = i * Math.PI * 2 / 5
+      beam(g, 'Exposed_root', [0, 0.34, 0], [Math.cos(a) * 0.64, 0.055, Math.sin(a) * 0.64], 0.16, 0.025, trunkMat)
+    }
+    beam(g, 'Crooked_crown', [0, 2.8, 0], [-0.28, 3.2, 0], 0.14, 0.10, trunkMat)
+    beam(g, 'Crown_tip', [-0.28, 3.2, 0], [0.12, 3.65, 0], 0.10, 0.055, trunkMat)
+    beam(g, 'Bare_twig', [0.5, 2.3, 0], [0.9, 2.55, -0.45], 0.075, 0.02, trunkMat)
+    batchRigid(g)
+    contactShadow(g, 1.15, 0.85)
     g.position.set(x, 0, z)
     this.scene.add(g)
     this.colliders.push({ minX: x - 0.3, maxX: x + 0.3, minZ: z - 0.3, maxZ: z + 0.3 })
@@ -668,6 +724,9 @@ export class World {
     )
     ground.rotation.x = -Math.PI / 2
     this.scene.add(ground)
+    ground.position.y = -0.065
+    ground.name = 'Ground_base'
+    this.scene.add(makeGround(), makeDistantManor())
 
     // 周边墙(留出电闸门缺口)
     this.wall(-B - 1, -B, -14, -B)
@@ -791,8 +850,8 @@ export class World {
     }
 
     // 雾与光(适度提亮:雾更薄、环境光/半球光/月光均加强,保留夜战氛围但看清 5m 外)
-    this.scene.fog = new THREE.FogExp2(0x11151c, 0.013)
-    this.scene.background = new THREE.Color(0x11151c)
+    this.scene.fog = new THREE.FogExp2(0x182b32, 0.013)
+    this.scene.background = new THREE.Color(0x182b32)
     const amb = new THREE.AmbientLight(0x4a5366, 2.6)
     this.scene.add(amb)
     // 半球光:冷天光/暗地面反弹,保证轮廓可读
@@ -801,13 +860,24 @@ export class World {
     const moon = new THREE.DirectionalLight(0xb8c8e8, 1.8)
     moon.position.set(-20, 40, -12)
     this.scene.add(moon)
+    moon.castShadow = true
+    moon.shadow.mapSize.set(2048, 2048)
+    Object.assign(moon.shadow.camera, { left: -40, right: 40, top: 40, bottom: -40, near: 1, far: 100 })
+    moon.shadow.normalBias = 0.035
     // 月亮(发光球)
     const moonBall = new THREE.Mesh(
       new THREE.SphereGeometry(2.2, 16, 16),
       new THREE.MeshBasicMaterial({ color: 0xdfe6f2, fog: false }),
     )
     moonBall.position.set(-38, 46, -26)
+    moonBall.name = 'Moon'
     this.scene.add(moonBall)
+    this.scene.traverse(o => {
+      if (o instanceof THREE.Mesh && !Array.isArray(o.material) && !o.material.transparent && o.name !== 'Moon') {
+        o.castShadow = o.name !== 'Slate_tiles_instanced' && o.name !== 'Ground_base'
+        o.receiveShadow = true
+      }
+    })
   }
 
   // 每帧动画:密码机灯闪烁、门开动画
@@ -823,6 +893,7 @@ export class World {
     // 板长边两端架在缺口两侧墙沿上,板面与地面约 45°,形成斜面阻挡(非平放)。
     // 放板即生效碰撞,动画仅视觉。
     for (const p of this.pallets) {
+      p.debris.visible = p.state === 'broken'
       if (p.fallT > 0) {
         p.fallT -= dt
         const k = 1 - Math.max(0, p.fallT) / p.fallDur

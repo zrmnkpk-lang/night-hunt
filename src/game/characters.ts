@@ -1,5 +1,6 @@
 // 程序化低多边形人形角色(幸存者/猎人)
 import * as THREE from 'three'
+import { bevelBox, box, material, dressSurvivor, dressHunter } from './art'
 
 // 透视轮廓共享材质(红色警示,穿墙可见)
 // 模块级单例:被所有人形共用,disposeScene 必须跳过它(释放后重开局透视会失效)
@@ -62,6 +63,12 @@ function makeLantern(): { g: THREE.Group; core: THREE.MeshStandardMaterial; ligh
   })
   const coreMesh = new THREE.Mesh(new THREE.SphereGeometry(0.055, 8, 8), core)
   g.add(top, bottom, handle, coreMesh)
+  g.name = 'Hand_lantern'
+  const brass = material('Lantern_brass', 0x967347, 0.6, 0.45)
+  box(g, 'Lantern_foot', [0.17, 0.028, 0.17], [0, -0.15, 0], brass)
+  const flame = new THREE.Mesh(new THREE.ConeGeometry(0.025, 0.095, 5), core)
+  flame.position.y = 0.03
+  g.add(flame)
   const light = new THREE.PointLight(0xffb35c, 2.4, 12.5, 1.4)
   light.position.y = 0.05
   g.add(light)
@@ -96,20 +103,20 @@ export function makeSurvivorMesh(color: number, isPlayer: boolean): Humanoid {
   head.add(eyeL, eyeR)
 
   // 躯干:毛衣 box
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.6, 0.32), sweaterMat)
+  const body = new THREE.Mesh(bevelBox(0.54, 0.6, 0.32, 0.065), sweaterMat)
   body.position.y = 0.96
   // 斜挎包:肩带斜跨胸前 + 包体挂腰侧
   const strap = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.72, 0.03), bagMat)
   strap.position.set(0.02, 0.06, 0.17)
   strap.rotation.z = 0.62
   body.add(strap)
-  const bag = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.28, 0.13), bagMat)
+  const bag = new THREE.Mesh(bevelBox(0.24, 0.28, 0.13), bagMat)
   bag.position.set(-0.28, -0.18, 0.08)
   bag.rotation.y = 0.25
   body.add(bag)
 
   // 手臂:毛衣袖 box(旋转轴在肩)+ 肤色手
-  const armGeo = new THREE.BoxGeometry(0.15, 0.52, 0.15)
+  const armGeo = bevelBox(0.15, 0.52, 0.15)
   armGeo.translate(0, -0.26, 0)
   const armL = new THREE.Mesh(armGeo, sweaterMat)
   armL.position.set(-0.35, 1.24, 0)
@@ -124,13 +131,13 @@ export function makeSurvivorMesh(color: number, isPlayer: boolean): Humanoid {
   armR.add(handR)
 
   // 腿:深蓝裤 box(旋转轴在髋)+ 白鞋
-  const legGeo = new THREE.BoxGeometry(0.18, 0.56, 0.18)
+  const legGeo = bevelBox(0.18, 0.56, 0.18)
   legGeo.translate(0, -0.3, 0)
   const legL = new THREE.Mesh(legGeo, pantsMat)
   legL.position.set(-0.14, 0.66, 0)
   const legR = new THREE.Mesh(legGeo, pantsMat)
   legR.position.set(0.14, 0.66, 0)
-  const shoeGeo = new THREE.BoxGeometry(0.2, 0.12, 0.32)
+  const shoeGeo = bevelBox(0.2, 0.12, 0.32)
   const shoeL = new THREE.Mesh(shoeGeo, shoeMat)
   shoeL.position.set(0, -0.62, 0.05)
   legL.add(shoeL)
@@ -149,6 +156,7 @@ export function makeSurvivorMesh(color: number, isPlayer: boolean): Humanoid {
   }
   lan.g.position.set(0, -0.62, 0.04)
   armR.add(lan.g)
+  dressSurvivor({ group, body, head, armL, armR, legL, legR }, color)
 
   // 透视轮廓(预建,默认隐藏,切换 visible 即可)
   const outline: THREE.Mesh[] = []
@@ -195,9 +203,9 @@ export function makeHunterMesh(): Humanoid {
   head.add(eyeL, eyeR)
 
   // 躯干:宽大黑袍 box + 肩部垫块(上宽下窄的斗篷轮廓)
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.82, 0.44), robeMat)
+  const body = new THREE.Mesh(bevelBox(0.72, 0.82, 0.44, 0.085), robeMat)
   body.position.y = 1.34
-  const shoulderGeo = new THREE.BoxGeometry(0.26, 0.3, 0.4)
+  const shoulderGeo = bevelBox(0.26, 0.3, 0.4, 0.06)
   const shoulderL = new THREE.Mesh(shoulderGeo, robeMat)
   shoulderL.position.set(-0.36, 0.34, 0)
   body.add(shoulderL)
@@ -205,12 +213,12 @@ export function makeHunterMesh(): Humanoid {
   shoulderR.position.set(0.36, 0.34, 0)
   body.add(shoulderR)
   // 袍摆:腰以下略宽的一段,盖到大腿
-  const skirt = new THREE.Mesh(new THREE.BoxGeometry(0.78, 0.42, 0.48), robeMat)
+  const skirt = new THREE.Mesh(bevelBox(0.68, 0.32, 0.40, 0.05), robeMat)
   skirt.position.y = -0.6
   body.add(skirt)
 
   // 手臂:黑袍袖 box(旋转轴在肩)
-  const armGeo = new THREE.BoxGeometry(0.18, 0.6, 0.18)
+  const armGeo = bevelBox(0.18, 0.6, 0.18, 0.045)
   armGeo.translate(0, -0.3, 0)
   const armL = new THREE.Mesh(armGeo, robeMat)
   armL.position.set(-0.46, 1.72, 0)
@@ -218,13 +226,13 @@ export function makeHunterMesh(): Humanoid {
   armR.position.set(0.46, 1.72, 0)
 
   // 腿:黑裤 box + 棕靴(旋转轴在髋)
-  const legGeo = new THREE.BoxGeometry(0.2, 0.62, 0.2)
+  const legGeo = bevelBox(0.2, 0.62, 0.2)
   legGeo.translate(0, -0.34, 0)
   const legL = new THREE.Mesh(legGeo, robeMat)
   legL.position.set(-0.17, 0.9, 0)
   const legR = new THREE.Mesh(legGeo, robeMat)
   legR.position.set(0.17, 0.9, 0)
-  const bootGeo = new THREE.BoxGeometry(0.24, 0.2, 0.36)
+  const bootGeo = bevelBox(0.24, 0.2, 0.36)
   const bootL = new THREE.Mesh(bootGeo, bootMat)
   bootL.position.set(0, -0.7, 0.06)
   legL.add(bootL)
@@ -241,6 +249,7 @@ export function makeHunterMesh(): Humanoid {
   weapon.add(hilt)
 
   group.add(body, head, armL, armR, legL, legR, weapon)
+  dressHunter({ group, body, head, armL, armR, legL, legR, weapon })
 
   // 猎灯:猎人自身不带提灯,但玩家扮演杀手时需要光源,否则全场只剩求生者的微弱提灯(近乎全黑)。
   // 默认 visible=false(AI 猎人靠自身 emissive 已足够),由 Engine.buildScene 在玩家扮演杀手时点亮。
@@ -261,6 +270,12 @@ export type Pose = 'stand' | 'crawl' | 'carried' | 'chaired'
 // injured:受伤姿态——身体前倾,跑动时仅单臂摆动(另一手捂腹)。
 export function animateHumanoid(h: Humanoid, dt: number, speed: number, pose: Pose, time: number, injured = false): void {
   const g = h.group
+  // Clear offsets left by a previous injured/chaired/carried pose before applying the next pose.
+  h.body.rotation.x = 0
+  h.body.scale.y = 1
+  h.armR.rotation.z = 0
+  h.armL.rotation.x = h.armR.rotation.x = 0
+  h.legL.rotation.x = h.legR.rotation.x = 0
   if (pose === 'crawl') {
     g.rotation.x = -Math.PI / 2 + 0.12
     g.position.y = 0.25
